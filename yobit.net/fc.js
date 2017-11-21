@@ -9,6 +9,12 @@ function FC()
 	this.dowork=true;
 	this.apos=false;
 	this.aft=false;
+	this.h=false;
+	this.stop=function()
+	{
+		if(this.apos===false) return;
+		$(this.h).text('FREE COINS');
+	}
 	this.go=function(start=false)
 	{
 		if(start||this.apos===false)
@@ -17,6 +23,8 @@ function FC()
 			this.aft=$('table#freecoins_table')[0];
 			this.apos=this.aft.rows.length-1;
 			this.res=[];
+			this.h=$('.h1_freecoins')[0];
+			$(this.h).click(function(){fc.stop();});
 			console.log('start',this.aft,this.apos);
 		} else
 		if(this.apos===0)
@@ -54,11 +62,12 @@ function FC()
 				it.style.width='200px';
 			}
 		}
-		if(this.apos%50==0) console.log((100*(1-this.apos/(this.aft.rows.length-1))).toFixed(2),'%');
+		//if(this.apos%50==0) console.log((100*(1-this.apos/(this.aft.rows.length-1))).toFixed(2),'%');
 		//console.log(this.apos,'/',this.aft.rows.length-1);
 		this.apos--;
 
 		}
+		$(this.h).text('CLEANING '+(100*(1-this.apos/(this.aft.rows.length-1))).toFixed(2)+'%');
 		if(this.dowork) setTimeout(function(){fc.go();},100);
 	}
 }
