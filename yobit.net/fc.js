@@ -14,6 +14,7 @@ function FC()
 	{
 		if(this.apos===false) return;
 		$(this.h).text('FREE COINS');
+		fc.dowork=false;
 	}
 	this.go=function(start=false)
 	{
@@ -34,7 +35,7 @@ function FC()
 			console.log('ok');
 		}
 		// продолжаем
-		for(var cnt=10;cnt>0;cnt--) if(this.aft.rows[this.apos])
+		for(var cnt=50;cnt>0;cnt--) if(this.aft.rows[this.apos])
 		{
 		var name=this.aft.rows[this.apos].cells[0].innerText.toLowerCase();
 		var amount=new Number(this.aft.rows[this.apos].cells[1].innerText);
@@ -68,9 +69,8 @@ function FC()
 
 		}
 		$(this.h).text('CLEANING '+(100*(1-this.apos/(this.aft.rows.length-1))).toFixed(2)+'%');
-		if(this.dowork) setTimeout(function(){fc.go();},100);
+		if(this.dowork) setTimeout(function(){fc.go();},500);
 	}
 }
 var fc=new FC();
-//fc.dowork=false;
 fc.go(true);
