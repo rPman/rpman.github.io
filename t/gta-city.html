@@ -1881,25 +1881,25 @@ function xrText(g,s,x,y,size,col,sp,align,weight){
 var VR_HELP=['левый стик — идти, клик — прыжок','правый стик — поворот, клик — сброс направления',
   'курок — время ×12, рукоять — бег','A — пауза · B — темп суток · X — звук'];
 
-/* панель на запястье: часы, темп суток, подсказки */
-var wr=xrPanel(560,300);
-var vrWrist=new THREE.Mesh(new THREE.PlaneGeometry(0.215,0.115),
+/* панель на запястье: только часы и режим — подписи крупно, чтобы читались */
+var wr=xrPanel(512,192);
+var vrWrist=new THREE.Mesh(new THREE.PlaneGeometry(0.19,0.0713),
   new THREE.MeshBasicMaterial({map:wr.t,transparent:true,depthWrite:false,side:THREE.DoubleSide}));
-vrWrist.position.set(0.004,-0.052,-0.01);
+vrWrist.position.set(0.004,-0.05,-0.006);
 vrWrist.rotation.x=-1.12;
 function drawWrist(){
-  var g=wr.g,W=560,H=300,h=Math.floor(sim.hour%24),mm=Math.floor((sim.hour%24-h)*60);
+  var g=wr.g,W=512,H=192,h=Math.floor(sim.hour%24),mm=Math.floor((sim.hour%24-h)*60);
   g.clearRect(0,0,W,H);
-  g.fillStyle='rgba(6,10,17,0.82)';g.fillRect(0,0,W,H);
+  g.fillStyle='rgba(6,10,17,0.8)';g.fillRect(0,0,W,H);
   g.strokeStyle='rgba(255,255,255,0.2)';g.lineWidth=3;g.strokeRect(1.5,1.5,W-3,H-3);
-  g.fillStyle='#ffc861';g.fillRect(0,0,5,H);
-  xrText(g,(h<10?'0':'')+h+':'+(mm<10?'0':'')+mm,30,56,54,'#e9eef6',3);
-  xrText(g,'ДЕНЬ '+sim.day+' · '+(night>0.5?'НОЧЬ':(golden>0.4?'ЗАКАТ':'ДЕНЬ')),W-30,56,19,'#8a97ab',5,'r');
-  xrText(g,audioMuted?'звук выключен':(fastF>0?'время ×12':'сутки за '+Math.round(DAY_LEN)+' с'),
-    30,102,19,audioMuted?'#ff8f80':(fastF>0?'#8fd3ff':'#ffc861'),3);
+  g.fillStyle='#ffc861';g.fillRect(0,0,6,H);
+  xrText(g,(h<10?'0':'')+h+':'+(mm<10?'0':'')+mm,34,66,62,'#e9eef6',4);
+  xrText(g,'ДЕНЬ '+sim.day,W-34,42,24,'#8a97ab',6,'r');
+  xrText(g,night>0.5?'НОЧЬ':(golden>0.4?'ЗАКАТ':'ДЕНЬ'),W-34,80,24,'#8a97ab',6,'r');
   g.strokeStyle='rgba(255,255,255,0.13)';g.lineWidth=2;
-  g.beginPath();g.moveTo(28,130);g.lineTo(W-28,130);g.stroke();
-  for(var i=0;i<VR_HELP.length;i++)xrText(g,VR_HELP[i],30,164+34*i,21,'#b6c3d4',1.4);
+  g.beginPath();g.moveTo(30,112);g.lineTo(W-30,112);g.stroke();
+  xrText(g,audioMuted?'звук выключен':(fastF>0?'время ×12':'сутки за '+Math.round(DAY_LEN)+' с'),
+    34,150,26,audioMuted?'#ff8f80':(fastF>0?'#8fd3ff':'#ffc861'),3);
   wr.t.needsUpdate=true;
 }
 drawWrist();
@@ -1912,10 +1912,11 @@ vrSheetMesh.renderOrder=999;
 vrSheetMesh.position.set(0,-0.05,-1.5);
 vrSheetMesh.visible=false;
 camera.add(vrSheetMesh);
-var vrSheetMode='';
+var vrSheetMode='', vrHelpT=0;
 function vrSheet(mode){
   mode=mode||'';
   if(vrSheetMode===mode)return;
+  if(mode!=='help')vrHelpT=0;
   vrSheetMode=mode;
   vrSheetMesh.visible=(mode!=='');
   if(mode==='')return;
@@ -1928,15 +1929,20 @@ function vrSheet(mode){
     xrText(g,'WASTED',W/2,H*0.46,112,'#ff5648',15,'c','700');
     xrText(g,'San Marlo не прощает невнимательности на переходах',W/2,H*0.7,21,'#c9a9a4',1.6,'c');
   }else{
-    g.fillStyle='rgba(4,7,12,0.76)';g.fillRect(0,0,W,H);
-    g.strokeStyle='rgba(255,200,97,0.4)';g.lineWidth=5;g.strokeRect(3,3,W-6,H-6);
-    xrText(g,'ПАУЗА',W/2,H*0.17,24,'#ffc861',15,'c');
+    g.fillStyle=mode==='help'?'rgba(4,7,12,0.6)':'rgba(4,7,12,0.76)';
+    g.fillRect(0,0,W,H);
+    g.strokeStyle=mode==='help'?'rgba(150,205,255,0.36)':'rgba(255,200,97,0.4)';
+    g.lineWidth=5;g.strokeRect(3,3,W-6,H-6);
+    xrText(g,mode==='help'?'УПРАВЛЕНИЕ ШЛЕМА':'ПАУЗА',W/2,H*0.17,24,
+      mode==='help'?'#a8d4ff':'#ffc861',15,'c');
     xrText(g,'SAN MARLO',W/2,H*0.37,84,'#e9eef6',11,'c');
     for(i=0;i<VR_HELP.length;i++)xrText(g,VR_HELP[i],W/2,H*0.57+i*40,22,'#9fb0c6',1.6,'c');
-    xrText(g,'A — продолжить',W/2,H*0.92,20,'#71839a',4,'c');
+    xrText(g,mode==='help'?'Y или клик правого стика — вернуть направление взгляда':'A — продолжить',
+      W/2,H*0.92,20,'#71839a',4,'c');
   }
   sh.t.needsUpdate=true;
 }
+function vrHelp(){vrSheet('help');vrHelpT=7;}
 
 /* название района — всплывает перед глазами */
 var vt=xrPanel(768,192);
@@ -2091,6 +2097,7 @@ function vrTick(dt){
   }
   wristT+=dt;
   if(wristT>0.15){wristT=0;drawWrist();}
+  if(vrHelpT>0){vrHelpT-=dt;if(vrHelpT<=0&&vrSheetMode==='help')vrSheet('');}
 }
 function resumeAudio(){try{if(actx&&actx.state==='suspended'&&actx.resume)actx.resume();}catch(e){}}
 function setShadowMap(px){
@@ -2104,7 +2111,9 @@ function onVrSwitch(on){
     xrRot=0;dolly.rotation.set(0,0,0);
     dolly.position.set(player.x,player.y+xrEyeFix,player.z);
     begin();resumeAudio();
-    vrSheet(player.dead?'dead':(paused?'pause':''));
+    if(player.dead)vrSheet('dead');
+    else if(paused)vrSheet('pause');
+    else vrHelp();
     setShadowMap(1024);
     xrHaptic(0.7,150);
   }else{
@@ -2112,6 +2121,10 @@ function onVrSwitch(on){
     vrToastT=0;vrToastMesh.visible=false;
     setShadowMap(2048);
     setPaused(false);
+    /* XRWebGLLayer меняет размер холста — возвращаем оконный */
+    camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight,false);
   }
 }
 
