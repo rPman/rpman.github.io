@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AR · сфера и руки</title>
+<style>
+  :root { --fg:#e8eef6; --dim:#8fa2b7; --ac:#63c8ff; --hi:#ff7a1a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#05080c; color:var(--fg);
+               font:15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  canvas { display:block; }
+
+  #start { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+           padding:24px; background:radial-gradient(120% 120% at 50% 0%, #101822 0%, #05080c 70%);
+           z-index:10; overflow:auto; }
+  .card { width:min(620px,100%); }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:.3px; }
+  .sub { color:var(--dim); margin:0 0 18px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin:0 0 14px; }
+  button { font:inherit; padding:11px 16px; border-radius:10px; border:1px solid #2b3a4c;
+           background:#132030; color:var(--fg); cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--ac); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.main { background:var(--ac); border-color:var(--ac); color:#04131f; font-weight:700; }
+  ul { margin:0 0 16px; padding-left:20px; color:var(--dim); }
+  ul b { color:var(--fg); font-weight:600; }
+  .cfg { display:grid; grid-template-columns:150px 1fr 54px; gap:8px 12px; align-items:center;
+         padding:12px 14px; border:1px solid #1d2836; border-radius:12px; background:#0a1119; margin:0 0 14px; }
+  .cfg label { color:var(--dim); }
+  .cfg output { text-align:right; color:var(--ac); }
+  input[type=range] { width:100%; accent-color:var(--ac); }
+  #note, #previewHint { color:var(--dim); font-size:13px; }
+  #previewHint { display:none; margin-top:8px; }
+  #err { position:fixed; left:16px; right:16px; bottom:16px; display:none; z-index:30;
+         padding:12px 14px; border:1px solid #6a2a1a; border-radius:12px; background:#2a1108; color:#ffd9c7; }
+
+  /* HUD: корень dom-overlay. В шлеме DOM может не показываться — тогда работают жесты рук. */
+  #hud { position:fixed; right:14px; bottom:14px; left:auto; display:none; z-index:20;
+         padding:10px 12px; border:1px solid #22303f; border-radius:12px;
+         background:rgba(8,14,20,.72); color:var(--fg); max-width:min(420px,92vw); }
+  body.running #hud { display:block; }
+  body.inar #hud { background:rgba(8,14,20,.55); }
+  #stat { color:var(--ac); }
+  #hudNote { color:var(--dim); font-size:12px; margin-top:4px; }
+  #hud .row { margin:8px 0 0; }
+  #hud button { padding:7px 11px; font-size:13px; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <div class="card">
+    <h1>AR: сфера, которую толкают руки</h1>
+    <p class="sub">Белая сфера поверх реального окружения. Толкают её собственные руки — контроллеры не нужны.</p>
+    <ul>
+      <li><b>Направление</b> — по нормали в точке касания (как у бильярдных шаров), а не вдоль движения руки.</li>
+      <li><b>Без инерции</b>: рука в движении — сфера уходит, рука встала — сфера встала.</li>
+      <li>Нужен шлем с passthrough-AR и hand tracking (Quest Browser) и <b>https</b> или <b>localhost</b>.</li>
+      <li>На запястье ничего нет: щипок переносит сферу перед собой, сжатие кулака прячет прокси рук.</li>
+    </ul>
+    <div class="row">
+      <button id="enterAR" class="main">Войти в AR</button>
+      <button id="preview">Предпросмотр без шлема</button>
+    </div>
+    <div class="cfg">
+      <label for="cfg_handPad">Запас кожи, м</label>
+      <input id="cfg_handPad" type="range" min="0.002" max="0.020" step="0.001" value="0.008">
+      <output id="out_handPad">0.008</output>
+      <label for="cfg_tangentialGain">Трение о кожу</label>
+      <input id="cfg_tangentialGain" type="range" min="0" max="0.8" step="0.05" value="0.3">
+      <output id="out_tangentialGain">0.3</output>
+      <label for="cfg_releaseDamping">Торможение, 1/с</label>
+      <input id="cfg_releaseDamping" type="range" min="4" max="40" step="1" value="14">
+      <output id="out_releaseDamping">14</output>
+    </div>
+    <p id="note">Чем больше «запас кожи», тем раньше сфера чувствует руку; «трение» добавляет занос вдоль
+      поверхности при скользящем ударе; «торможение» гасит короткое доскольжение после отрыва.</p>
+    <p id="previewHint">Мышь = псевдо-кисть из шести шаров. Толкните сферу краем — она уйдёт по нормали
+      касания, а не по направлению курсора.</p>
+  </div>
+</div>
+
+<div id="hud">
+  <div id="stat">…</div>
+  <div id="hudNote"></div>
+  <div class="row">
+    <button id="btnReset">Перед собой</button>
+    <button id="btnHands">Прокси рук</button>
+  </div>
+</div>
+
+<div id="err"></div>
+
+<script>/*__THREE__*/</script>
+<script>/*__PHYS__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
