@@ -1,146 +1,62 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WebXR — белая сфера</title>
-
-  <style>
-    html, body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      background: transparent;
-      font-family: sans-serif;
-    }
-
-    canvas {
-      display: block;
-    }
-
-    #start {
-      position: fixed;
-      left: 50%;
-      top: 50%;
-      transform: translate(-50%, -50%);
-      padding: 14px 20px;
-      font-size: 18px;
-      z-index: 1;
-    }
-
-    #message {
-      position: fixed;
-      left: 50%;
-      top: calc(50% + 45px);
-      transform: translateX(-50%);
-      color: #333;
-      text-align: center;
-      z-index: 1;
-    }
-  </style>
-
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
-      }
-    }
-  </script>
+    <meta charset="UTF-8">
+    <title>WebXR — Белый шар</title>
+    <style>
+        body { margin: 0; background: #000; }
+        button {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            font-size: 18px;
+            cursor: pointer;
+        }
+    </style>
 </head>
 <body>
-  <button id="start">Запустить AR</button>
-  <div id="message"></div>
+<button id="btn">Войти в VR</button>
 
-  <script type="module">
-    import * as THREE from "three";
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 
-    const startButton = document.querySelector("#start");
-    const message = document.querySelector("#message");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
 
-    const scene = new THREE.Scene();
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x888888);
 
-    const camera = new THREE.PerspectiveCamera(
-      70,
-      window.innerWidth / window.innerHeight,
-      0.01,
-      20
-    );
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
 
-    const renderer = new THREE.WebGLRenderer({
-      alpha: true,
-      antialias: true
+// Белый шар
+const sphere = new THREE.Mesh(
+    new THREE.SphereGeometry(0.3, 64, 64),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6, metalness: 0.0 })
+);
+sphere.position.set(0, 1.5, -1.5);
+scene.add(sphere);
+
+// Невидимое освещение (даёт тень/затемнение на шаре)
+const light = new THREE.DirectionalLight(0xffffff, 3);
+light.position.set(2, 4, 3);
+scene.add(light);
+
+// Лёгкий ambient, чтобы тёмная сторона не была абсолютно чёрной
+scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+// Кнопка входа
+document.getElementById('btn').addEventListener('click', async () => {
+    const session = await navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['local-floor']
     });
+    renderer.xr.setSession(session);
+});
 
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setClearColor(0x000000, 0);
-    renderer.xr.enabled = true;
-    renderer.xr.setReferenceSpaceType("local");
-
-    document.body.appendChild(renderer.domElement);
-
-    // Сфера диаметром 30 см, в 1 метре перед начальной позицией.
-    const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry(0.15, 48, 32),
-      new THREE.MeshStandardMaterial({
-        color: 0xffffff,
-        roughness: 0.85,
-        metalness: 0
-      })
-    );
-    sphere.position.set(0, 0, -1);
-    scene.add(sphere);
-
-    // Невидимое освещение: оно только создаёт объёмное затенение на сфере.
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x303038, 1.2));
-
-    const keyLight = new THREE.DirectionalLight(0xffffff, 2);
-    keyLight.position.set(-0.5, 1, 0.5);
-    scene.add(keyLight);
-
-    renderer.setAnimationLoop(() => {
-      renderer.render(scene, camera);
-    });
-
-    startButton.addEventListener("click", async () => {
-      if (!navigator.xr) {
-        message.textContent = "WebXR не поддерживается этим браузером.";
-        return;
-      }
-
-      try {
-        const supported =
-          await navigator.xr.isSessionSupported("immersive-ar");
-
-        if (!supported) {
-          message.textContent =
-            "На этом устройстве режим immersive-ar недоступен.";
-          return;
-        }
-
-        const session = await navigator.xr.requestSession("immersive-ar", {
-          requiredFeatures: ["local"]
-        });
-
-        await renderer.xr.setSession(session);
-        startButton.hidden = true;
-        message.hidden = true;
-
-        session.addEventListener("end", () => {
-          startButton.hidden = false;
-          message.hidden = false;
-        });
-      } catch (error) {
-        message.textContent = `Не удалось запустить AR: ${error.message}`;
-      }
-    });
-
-    window.addEventListener("resize", () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    });
-  </script>
+renderer.setAnimationLoop(() => renderer.render(scene, camera));
+</script>
 </body>
 </html>
