@@ -1,16 +1,51 @@
-<html>
+<!doctype html>
+<html lang="ru">
 <head>
-<meta charset="utf-8"/>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ar-h — страницы</title>
+<style>
+  :root { --fg:#e8eef6; --dim:#8fa2b7; --ac:#63c8ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:28px 20px 40px; background:#14161a; color:var(--fg);
+         font:15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  main { max-width:760px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.note { color:var(--dim); margin:0 0 22px; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { margin:0 0 16px; padding:12px 14px; border:1px solid #22303f; border-radius:12px;
+       background:#101922; }
+  a { color:var(--ac); text-decoration:none; font-weight:700; }
+  a:hover { text-decoration:underline; }
+  .stamp { color:#ffd24a; }
+  .desc { display:block; color:var(--dim); margin-top:4px; }
+  footer { margin-top:26px; color:#5f6d7c; font-size:13px; }
+  code { color:var(--ac); }
+</style>
 </head>
 <body>
-<p>
-<a href="ar-h.html">ar-h.html</a> - AR эксперимент с отслеживанием рук и коллизиями с предметами
-</p>
-<p>
-<a href="ar-jolt-ar.html">ar-jolt-ar.html</a> - то же, но физика на Jolt, и это AR для шлема: формы честные, толкает кисть (25 суставов на руку) или контроллер, фигуры не улетают за экран
-</p>
-<p>
-<a href="ar-jolt.html">ar-jolt.html</a> - Jolt без WebXR: плоская страница, чтобы прогнать физику мышью
-</p>
+<main>
+  <h1>ar-h — AR «фигуры и руки»</h1>
+  <p class="note">Нужен шлем с passthrough-AR и https (или localhost).</p>
+  <ul>
+    <li>
+      <span class="stamp">2026-11-04 22:08</span> <a href="ar-jolt-ar.html">ar-jolt-ar.html</a>
+      <span class="desc">AR для шлема на Jolt: честные формы (кольцо настояще дырявое, у куба
+        есть рёбра и углы), толкает кисть — 25 суставов на руку, радиус берётся из
+        XRJointPose.radius; захват предмета пальцами выводится из физики процесса, а не из жеста;
+        фигуры не улетают за экран (торможение + поводок 0.9 м).</span>
+    </li>
+    <li>
+      <span class="stamp">2026-11-04 16:15</span> <a href="ar-jolt.html">ar-jolt.html</a>
+      <span class="desc">Jolt без WebXR: плоская страница, чтобы прогнать ту же физику мышью.</span>
+    </li>
+  </ul>
+  <footer>
+    Дата перед именем страницы — время последней правки этого файла (ставит
+    <code>node ar/index-stamp.mjs</code>); GitHub Pages пересобирается несколько минут после
+    push, так что по этой дате видно, какая сборка уже отдаётся.
+    Старая версия на своей физике (<code>ar-h.html</code>) удалена 2026-11-04 — всё в истории git.
+  </footer>
+</main>
 </body>
 </html>
