@@ -83,19 +83,28 @@ function send(method, params) {
     ws.send(JSON.stringify({ id: my, method, params: params || {} }));
   });
 }
-const waitEvent = (name, ms) => new Promise((res, rej) => {
-  const t0 = Date.now();
-  const iv = setInterval(() => {
-    if (events.some((e) => e.method === name)) { clearInterval(iv); res(true); }
-    else if (Date.now() - t0 > ms) { clearInterval(iv); rej(new Error('нет ' + name + ' за ' + ms + ' мс')); }
-  }, 20);
-});
-
 await send('Page.enable');
 await send('Runtime.enable');
 await send('Log.enable').catch(() => {});
-await send('Page.navigate', { url });
-await waitEvent('Page.loadEventFired', 30000);
+await send('Page.navigate', { url }).catch(() => {});
+// Ждать именно loadEventFired нельзя: вкладка создаётся уже с URL, и при прогретом кеше
+// Chrome грузится быстрее, чем успеваешь подписаться (проверено: событие проходит ДО
+// Page.enable, и прогон висит 30 с на «нет Page.loadEventFired»). Поэтому смотрим
+// document.readyState; сам подъём Jolt ждём ниже по __ja.readyPromise.
+{
+  const t0 = Date.now();
+  let rs = '';
+  for (;;) {
+    try {
+      const r = await send('Runtime.evaluate',
+        { expression: 'document.readyState', returnByValue: true });
+      rs = r.result && r.result.value;
+    } catch (e) { rs = ''; }
+    if (rs === 'complete') break;
+    if (Date.now() - t0 > 30000) throw new Error('document.readyState не стал complete за 30000 мс (сейчас ' + rs + ')');
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
 
 /* Консоль страницы наружу: без неё «страница не поднялась» ни о чём не говорит. */
 function flushConsole() {
