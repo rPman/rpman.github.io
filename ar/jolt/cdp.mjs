@@ -16,7 +16,11 @@ import { dirname, resolve, join, normalize, extname } from 'node:path';
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const argv = process.argv.slice(2);
-const pagePath = argv[0] && argv[0].startsWith('/') ? argv[0] : '/ar-jolt-ar.html';
+// Первый аргумент — либо путь внутри каталога проекта (тогда поднимется локальный http-сервер),
+// либо готовый URL целиком: опубликованную страницу тоже надо уметь проверить живым браузером.
+const external = argv[0] && /^https?:\/\//.test(argv[0]);
+const pagePath = external ? argv[0]
+  : (argv[0] && argv[0].startsWith('/') ? argv[0] : '/ar-jolt-ar.html');
 const expr = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
 const shotAt = argv.indexOf('--shot');
 const shot = shotAt >= 0 ? argv[shotAt + 1] : null;
@@ -28,19 +32,22 @@ const CDP = process.env.CDP || 'http://127.0.0.1:9222';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.wasm': 'application/wasm', '.json': 'application/json', '.map': 'application/json',
   '.css': 'text/css; charset=utf-8', '.png': 'image/png' };
-const server = createServer((req, res) => {
-  const p = decodeURIComponent(req.url.split('?')[0]);
-  const abs = normalize(join(project, p));
-  if (!abs.startsWith(project) || !existsSync(abs)) { res.writeHead(404); res.end('нет ' + p); return; }
-  res.writeHead(200, { 'content-type': MIME[extname(abs)] || 'application/octet-stream',
-    'cache-control': 'no-store' });
-  res.end(readFileSync(abs));
-});
-// Браузер может быть не на этой машине (CDP проброшен туннелем), поэтому сервер обязан
-// слушать адрес, доступный ОТТУДА: SRV_HOST=192.168.254.11 node ar/jolt/cdp.mjs …
-const SRV_HOST = process.env.SRV_HOST || '127.0.0.1';
-await new Promise((r) => server.listen(0, SRV_HOST, r));
-const url = 'http://' + SRV_HOST + ':' + server.address().port + pagePath;
+let server = null, url = pagePath;
+if (!external) {
+  // Браузер может быть не на этой машине (CDP проброшен туннелем), поэтому сервер обязан
+  // слушать адрес, доступный ОТТУДА: SRV_HOST=192.168.254.11 node ar/jolt/cdp.mjs …
+  const SRV_HOST = process.env.SRV_HOST || '127.0.0.1';
+  server = createServer((req, res) => {
+    const p = decodeURIComponent(req.url.split('?')[0]);
+    const abs = normalize(join(project, p));
+    if (!abs.startsWith(project) || !existsSync(abs)) { res.writeHead(404); res.end('нет ' + p); return; }
+    res.writeHead(200, { 'content-type': MIME[extname(abs)] || 'application/octet-stream',
+      'cache-control': 'no-store' });
+    res.end(readFileSync(abs));
+  });
+  await new Promise((r) => server.listen(0, SRV_HOST, r));
+  url = 'http://' + SRV_HOST + ':' + server.address().port + pagePath;
+}
 
 /* ------------------------------- CDP по минимуму ------------------------- */
 async function target() {
@@ -145,4 +152,4 @@ if (shot) {
 }
 if (!keep) await send('Target.closeTarget', { targetId: t.id }).catch(() => {});
 ws.close();
-server.close();
+if (server) server.close();
