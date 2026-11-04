@@ -1,0 +1,148 @@
+/* Dev-инструмент: гоняет страницу через CDP на уже запущенном Chrome (127.0.0.1:9222).
+ *
+ *   node ar/jolt/cdp.mjs /ar-jolt-ar.html                 — просто поднять страницу
+ *   node ar/jolt/cdp.mjs /ar-jolt-ar.html "__ja.info()"    — вычислить и напечатать JSON
+ *   node ar/jolt/cdp.mjs /ar-jolt-ar.html "..." --shot /tmp/arhands/cdp.png
+ *   node ar/jolt/cdp.mjs ... --keep                        — не закрывать вкладку
+ *
+ * Смысл: headless-Chrome на этой машине без GPU даёт ~2 кадра в секунду, а живой rAF-цикл —
+ * как раз то, что проверяется. Здесь кадры настоящие, вкладка своя, чужие не трогаются.
+ * Каталог проекта при этом раздаётся локальным http-сервером: ES-модули из file:// не грузятся.
+ */
+import { createServer } from 'node:http';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve, join, normalize, extname } from 'node:path';
+
+const project = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const argv = process.argv.slice(2);
+const pagePath = argv[0] && argv[0].startsWith('/') ? argv[0] : '/ar-jolt-ar.html';
+const expr = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+const shotAt = argv.indexOf('--shot');
+const shot = shotAt >= 0 ? argv[shotAt + 1] : null;
+// Свою вкладку по умолчанию закрываем (иначе от прогонов их становится десятки), --keep
+// оставляет открытой: рядом монитор, на кадр можно посмотреть живьём.
+const keep = argv.includes('--keep');
+const CDP = process.env.CDP || 'http://127.0.0.1:9222';
+
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.wasm': 'application/wasm', '.json': 'application/json', '.map': 'application/json',
+  '.css': 'text/css; charset=utf-8', '.png': 'image/png' };
+const server = createServer((req, res) => {
+  const p = decodeURIComponent(req.url.split('?')[0]);
+  const abs = normalize(join(project, p));
+  if (!abs.startsWith(project) || !existsSync(abs)) { res.writeHead(404); res.end('нет ' + p); return; }
+  res.writeHead(200, { 'content-type': MIME[extname(abs)] || 'application/octet-stream',
+    'cache-control': 'no-store' });
+  res.end(readFileSync(abs));
+});
+// Браузер может быть не на этой машине (CDP проброшен туннелем), поэтому сервер обязан
+// слушать адрес, доступный ОТТУДА: SRV_HOST=192.168.254.11 node ar/jolt/cdp.mjs …
+const SRV_HOST = process.env.SRV_HOST || '127.0.0.1';
+await new Promise((r) => server.listen(0, SRV_HOST, r));
+const url = 'http://' + SRV_HOST + ':' + server.address().port + pagePath;
+
+/* ------------------------------- CDP по минимуму ------------------------- */
+async function target() {
+  // Своя вкладка: /json/new в свежем Chrome требует PUT, а не GET.
+  const created = await fetch(CDP + '/json/new?' + encodeURIComponent('about:blank'),
+    { method: 'PUT' });
+  const t = await created.json();
+  if (!t.webSocketDebuggerUrl) throw new Error('не удалось открыть вкладку: ' + JSON.stringify(t));
+  return t;
+}
+const t = await target();
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+
+let id = 0;
+const pending = new Map();
+const events = [];
+ws.onmessage = (m) => {
+  const msg = JSON.parse(m.data);
+  if (msg.id && pending.has(msg.id)) {
+    const { res, rej } = pending.get(msg.id);
+    pending.delete(msg.id);
+    msg.error ? rej(new Error(JSON.stringify(msg.error))) : res(msg.result);
+  } else if (msg.method) events.push(msg);
+};
+function send(method, params) {
+  return new Promise((res, rej) => {
+    const my = ++id;
+    pending.set(my, { res, rej });
+    ws.send(JSON.stringify({ id: my, method, params: params || {} }));
+  });
+}
+const waitEvent = (name, ms) => new Promise((res, rej) => {
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    if (events.some((e) => e.method === name)) { clearInterval(iv); res(true); }
+    else if (Date.now() - t0 > ms) { clearInterval(iv); rej(new Error('нет ' + name + ' за ' + ms + ' мс')); }
+  }, 20);
+});
+
+await send('Page.enable');
+await send('Runtime.enable');
+await send('Log.enable').catch(() => {});
+await send('Page.navigate', { url });
+await waitEvent('Page.loadEventFired', 30000);
+
+/* Консоль страницы наружу: без неё «страница не поднялась» ни о чём не говорит. */
+function flushConsole() {
+  const lines = [];
+  for (const e of events) {
+    if (e.method === 'Runtime.consoleAPICalled') {
+      lines.push('[консоль ' + e.params.type + '] ' + e.params.args
+        .map((a) => a.value !== undefined ? a.value : (a.description || a.type)).join(' '));
+    } else if (e.method === 'Runtime.exceptionThrown') {
+      lines.push('[исключение] ' + (e.params.exceptionDetails.exception &&
+        e.params.exceptionDetails.exception.description || e.params.exceptionDetails.text));
+    } else if (e.method === 'Log.entryAdded') {
+      lines.push('[лог ' + e.params.entry.source + '/' + e.params.entry.level + '] ' +
+        e.params.entry.text + (e.params.entry.url ? '  ' + e.params.entry.url : ''));
+    }
+  }
+  events.length = 0;
+  return lines;
+}
+
+async function evalJs(expression, awaitPromise) {
+  const r = await send('Runtime.evaluate',
+    { expression, awaitPromise: !!awaitPromise, returnByValue: true });
+  if (r.exceptionDetails) throw new Error('в странице: ' +
+    (r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text));
+  return r.result.value;
+}
+
+/* Ждём, пока страница поднимет Jolt (wasm-compat раскод base64 и компилирует ~2 с) */
+const ready = await evalJs(`(async () => {
+  for (let i = 0; i < 300 && !(window.__ja && window.__ja.readyPromise); i++)
+    await new Promise((r) => setTimeout(r, 20));
+  if (!window.__ja) return 'нет window.__ja';
+  await window.__ja.readyPromise;
+  return window.__ja.ready ? 'ready' : 'не поднялся';
+})()`, true);
+console.log('страница: ' + ready + '   (' + url + ')');
+for (const line of flushConsole()) console.log(line);
+
+if (ready === 'ready') {
+  /* Пропускная способность кадров — то, ради чего всё это. */
+  const fps = await evalJs(`(async () => {
+    const d0 = window.__ja.diag(), t0 = performance.now();
+    await new Promise((r) => setTimeout(r, 3000));
+    const d1 = window.__ja.diag();
+    return { fps: ((d1.frames - d0.frames) / ((performance.now() - t0) / 1000)).toFixed(1),
+      calls: d1.calls, tris: d1.tris, perf: window.__ja.perf() };
+  })()`, true);
+  console.log('кадры: ' + JSON.stringify(fps));
+}
+
+if (expr) console.log('eval: ' + JSON.stringify(await evalJs(expr, true), null, 1));
+if (shot) {
+  const s = await send('Page.captureScreenshot', { format: 'png' });
+  writeFileSync(shot, Buffer.from(s.data, 'base64'));
+  console.log('скриншот: ' + shot + ' (' + (readFileSync(shot).length / 1024).toFixed(0) + ' КБ)');
+}
+if (!keep) await send('Target.closeTarget', { targetId: t.id }).catch(() => {});
+ws.close();
+server.close();

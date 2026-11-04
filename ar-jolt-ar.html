@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AR · Jolt · фигуры и палец</title>
+<style>
+  :root { --fg:#e8eef6; --dim:#8fa2b7; --ac:#63c8ff; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#14161a; color:var(--fg);
+               font:14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  canvas { display:block; }
+
+  #start { position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
+           padding:22px; overflow:auto;
+           background:radial-gradient(120% 120% at 50% 0%, #101822 0%, #0b0e13 70%); }
+  body.running #start { display:none; }
+  .card { width:min(640px,100%); }
+  h1 { font-size:21px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin:0 0 14px; }
+  ul { margin:0 0 14px; padding-left:20px; color:var(--dim); }
+  ul b { color:var(--fg); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin:0 0 12px; }
+  button { font:inherit; padding:11px 15px; border-radius:10px; border:1px solid #2b3a4c;
+           background:#132030; color:var(--fg); cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--ac); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.main { background:var(--ac); border-color:var(--ac); color:#04131f; font-weight:700; }
+
+  /* HUD — корень dom-overlay. Если шлем DOM не показывает, остаются жесты: щипок и кулак. */
+  #hud { position:fixed; left:12px; right:12px; bottom:12px; z-index:20; display:none;
+         padding:10px 12px; border:1px solid #22303f; border-radius:12px;
+         background:rgba(8,14,20,.72); max-width:min(560px,94vw); }
+  body.running #hud { display:block; }
+  body.inar #hud { background:rgba(8,14,20,.5); }
+  #stat { color:var(--ac); }
+  #hudNote { color:var(--dim); font-size:12px; margin-top:4px; }
+  #hud .row { margin:8px 0 0; }
+  #hud button { padding:7px 11px; font-size:13px; }
+  #err { position:fixed; left:12px; right:12px; bottom:12px; z-index:30; display:none;
+         padding:12px 14px; border:1px solid #6a2a1a; border-radius:12px; background:#2a1108; color:#ffd9c7; }
+  #status { color:var(--dim); margin:0 0 10px; white-space:pre-wrap; }
+  #report { position:fixed; left:0; bottom:0; margin:0; color:#7c848d; font:11px/1.3 monospace;
+            white-space:pre-wrap; opacity:.3; max-height:40vh; overflow:hidden; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <div class="card">
+    <h1>AR: фигуры на Jolt, их толкает палец</h1>
+    <p class="sub">Три фигуры поверх реального окружения: <span style="color:#ff6b57">шар</span>,
+      <span style="color:#ffd24a">кольцо</span>, <span style="color:#57b6ff">куб</span>. Формы честные —
+      кольцо настояще дырявое (16 капсул по кольцу, примитива тора в Jolt нет), у куба есть рёбра и углы.</p>
+    <div id="status">загрузка jolt…</div>
+    <ul>
+      <li><b>Толкает палец</b> указательного: рука приоритетнее контроллера, если hand tracking
+        включён. Если рук нет — толкает контроллер (сфера 20 мм).</li>
+      <li><b>Движение трёхмерное:</b> шарик можно ввести ВНУТРЬ кольца, а не водить по экрану.
+        Дырка кольца развёрнута вдоль взгляда.</li>
+      <li><b>Фигуры не улетают:</b> торможение 6 1/с (≈1 с до остановки) и поводок 0.9 м вокруг
+        точки появления — дальше ни один удар не выносит фигуру за экран.</li>
+      <li>Нужен шлем с passthrough-AR и <b>https</b>. Щипок переносит фигуры перед собой,
+        сжатие кулака отправляет отладочный отчёт.</li>
+    </ul>
+    <div class="row">
+      <button id="enterAR" class="main">Войти в AR</button>
+      <button id="preview">Предпросмотр без шлема</button>
+    </div>
+  </div>
+</div>
+
+<div id="hud">
+  <div id="stat">…</div>
+  <div id="hudNote"></div>
+  <div class="row">
+    <button id="btnReset">Перед собой</button>
+    <button id="btnHands">Прокси пальца</button>
+    <button id="btnReport">Отладка</button>
+  </div>
+</div>
+
+<div id="err"></div>
+<pre id="report"></pre>
+
+<script src="ar/three-r128.min.js"></script>
+<script type="module" src="ar/jolt/ar-page.js"></script>
+</body>
+</html>

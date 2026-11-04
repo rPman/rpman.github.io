@@ -10,10 +10,8 @@
  * скриншот сам по себе ни о чём не говорит.
  */
 import initJolt from '../jolt-physics.wasm-compat.js';
-
-const DT = 1 / 72;
-const HAND_PAD = 0.008;            // = PhysicsSettings.mSpeculativeContactDistance
-const L_HAND = 0, L_SHAPE = 1, L_STATIC = 2;
+import { DT, HAND_PAD, L_HAND, L_SHAPE, settings, setSpeculative, sphereShape, boxShape,
+  torusShape, bodySettings, addBody, contactRecorder } from './jolt-setup.js';
 
 const FIGS = [
   { id: 'sphere', x: -0.30, color: 0xff6b57, r: 0.085 },
@@ -110,104 +108,36 @@ const bodies = new Map();                        // id -> { body, mesh }
 const fingers = [];                              // kinematic BodyID
 let frameContacts = [];
 
-function torusShape(J, R, r, n) {
-  const cs = new J.StaticCompoundShapeSettings();
-  const half = R * Math.sin(Math.PI / n);
-  for (let i = 0; i < n; i++) {
-    const a = (i + 0.5) * 2 * Math.PI / n;
-    const cap = new J.CapsuleShapeSettings(half, r);
-    cap.mConvexRadius = 0;                       // выпуклый радиус съедает форму
-    alive.push(cap);
-    cs.AddShape(V(R * Math.cos(a), R * Math.sin(a), 0), J.Quat.prototype.sRotation(V(0, 0, 1), a), cap, 0);
-  }
-  const res = cs.Create();
-  if (!res.IsValid()) throw new Error('compound не собрался: ' + res.GetError());
-  const sh = res.Get();
-  alive.push(cs, res, sh);
-  return sh;
-}
 function shapeFor(J, f) {
-  if (f.id === 'sphere') { const s = new J.SphereShape(f.r); alive.push(s); return s; }
-  const bs = f.id === 'cube' ? new J.BoxShapeSettings(V(f.half, f.half, f.half))
-                             : torusShape(J, f.R, f.tube, f.seg);
-  if (f.id === 'cube') {
-    bs.mConvexRadius = 0;                        // иначе рёбра и углы съедены
-    alive.push(bs);
-    const sh = bs.Create().Get();
-    alive.push(sh);
-    return sh;
-  }
-  return bs;
+  if (f.id === 'sphere') return sphereShape(J, alive, f.r);
+  if (f.id === 'cube') return boxShape(J, alive, f.half);
+  return torusShape(J, alive, f.R, f.tube, f.seg);
 }
 
-function addBody(J, shape, x, y, z, motion, layer) {
-  const id = bi.CreateAndAddBody(new J.BodyCreationSettings(shape, V(x, y, z), Q(), motion, layer),
-    J.EActivate_Activate);
-  return new J.BodyID(id.GetIndexAndSequenceNumber());   // id живёт только в копии
-}
-
-/* Слушатель контактов объявляется внутри boot(): базовый класс ContactListenerJS появляется
- * в биндинге только после загрузки wasm. Методы — СОБСТВЕННЫЕ свойства инстанса: embind
- * проверяет hasOwnProperty и иначе падает на первом шаге. */
 async function boot() {
   Jolt = await initJolt();
   V = (x, y, z) => new Jolt.Vec3(x, y, z);
   Q = () => Jolt.Quat.prototype.sIdentity();
 
-  const st = new Jolt.JoltSettings();
-  st.mMaxBodies = 512; st.mMaxBodyPairs = 4096; st.mMaxContactConstraints = 2048;
-  st.mMaxWorkerThreads = 0;
-  const bpl = new Jolt.BroadPhaseLayerInterfaceTable(3, 3);
-  bpl.MapObjectToBroadPhaseLayer(L_HAND, new Jolt.BroadPhaseLayer(0));
-  bpl.MapObjectToBroadPhaseLayer(L_SHAPE, new Jolt.BroadPhaseLayer(1));
-  bpl.MapObjectToBroadPhaseLayer(L_STATIC, new Jolt.BroadPhaseLayer(2));
-  const opl = new Jolt.ObjectLayerPairFilterTable(3);
-  opl.EnableCollision(L_HAND, L_SHAPE);          // таблица пар создаётся ВЫКЛЮЧЕННОЙ
-  opl.EnableCollision(L_SHAPE, L_SHAPE);
-  opl.EnableCollision(L_HAND, L_STATIC);
-  opl.EnableCollision(L_SHAPE, L_STATIC);
-  opl.DisableCollision(L_HAND, L_HAND);          // 50 суставов не расталкивают друг друга
-  st.mBroadPhaseLayerInterface = bpl;
-  st.mObjectVsBroadPhaseLayerFilter = new Jolt.ObjectVsBroadPhaseLayerFilterTable(bpl, 3, opl, 3);
-  st.mObjectLayerPairFilter = opl;
-
-  ji = new Jolt.JoltInterface(st);
+  ji = new Jolt.JoltInterface(settings(Jolt, alive));
   ps = ji.GetPhysicsSystem();
   bi = ps.GetBodyInterfaceNoLock();
   ps.SetGravity(V(0, 0, 0));
-  const set = ps.GetPhysicsSettings();
-  set.mSpeculativeContactDistance = HAND_PAD;    // here lives handPad (default 0.02!)
-  ps.SetPhysicsSettings(set);
+  setSpeculative(ps, HAND_PAD);              // здесь живёт handPad (по умолчанию 0.02!)
 
-  class Listener extends Jolt.ContactListenerJS {
-    constructor() {
-      super();
-      this.OnContactValidate = () => Jolt.ValidateResult_AcceptContact;
-      this.OnContactAdded = (a, b, mp) => rec(a, b, mp);
-      this.OnContactPersisted = (a, b, mp) => rec(a, b, mp);
-      this.OnContactRemoved = () => {};
-    }
-  }
-  function rec(b1, b2, mp) {
-    const m = Jolt.wrapPointer(mp, Jolt.ContactManifold);
-    const p = m.GetWorldSpaceContactPointOn1(0);
-    frameContacts.push({ a: Jolt.wrapPointer(b1, Jolt.Body).GetID().GetIndexAndSequenceNumber(),
-      b: Jolt.wrapPointer(b2, Jolt.Body).GetID().GetIndexAndSequenceNumber(),
-      pen: m.get_mPenetrationDepth(), x: p.GetX(), y: p.GetY(), z: p.GetZ() });
-  }
-  alive.push(new Listener());
-  ps.SetContactListener(alive[alive.length - 1]);
+  frameContacts = contactRecorder(Jolt, alive, ps);
 
   for (const f of FIGS) {
-    const id = addBody(Jolt, shapeFor(Jolt, f), f.x, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE);
+    const id = addBody(Jolt, bi,
+      bodySettings(Jolt, shapeFor(Jolt, f), f.x, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE));
     bi.SetMaxLinearVelocity(id, 2.5);
     bi.SetMaxAngularVelocity(id, 10);
     bodies.set(f.id, id);
   }
   for (let i = 0; i < FINGERS; i++) {
-    const sh = new Jolt.SphereShape(FINGER_R);
-    alive.push(sh);
-    fingers.push(addBody(Jolt, sh, -0.3, 0, i * 0.05, Jolt.EMotionType_Kinematic, L_HAND));
+    fingers.push(addBody(Jolt, bi,
+      bodySettings(Jolt, sphereShape(Jolt, alive, FINGER_R), -0.3, 0, i * 0.05,
+        Jolt.EMotionType_Kinematic, L_HAND)));
   }
 
   say('jolt ok: тел ' + ps.GetNumBodies() + ', бублик = ' + FIGS[2].seg + ' капсул, ' +
@@ -242,7 +172,7 @@ function drive(id, x, y, z) {                    // кинематика: ТОЛ
 
 function stepPhysics(n, fill) {
   for (let k = 0; k < n; k++) {
-    frameContacts = [];
+    frameContacts.length = 0;               // магазин пишет в этот же массив, не в новый
     if (fill) {
       const buf = new Float32Array(FINGERS * 4);
       fill(buf);
@@ -318,11 +248,7 @@ window.__js = {
     bi.SetAngularVelocity(b, V(0, 0, 0));
   },
   cfg(o) {
-    if (o && o.handPad !== undefined) {
-      const s = ps.GetPhysicsSettings();
-      s.mSpeculativeContactDistance = o.handPad;
-      ps.SetPhysicsSettings(s);
-    }
+    if (o && o.handPad !== undefined) setSpeculative(ps, o.handPad);
   },
   freeze(v) { frozen = !!v; },
   touchDots() { return touchMeshes.filter((m) => m.visible).length; },
