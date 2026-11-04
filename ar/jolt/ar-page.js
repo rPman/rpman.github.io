@@ -207,6 +207,8 @@ async function boot() {
   say('jolt ok: тел ' + ps.GetNumBodies() + ', бублик = ' + FIGS[1].seg + ' капсул, damping ' +
     DAMP + ', leash ' + leashMeters + ' м, рук по ' + HAND_SLOTS + ' суставов, режим ' + handsMode +
     ', захват ' + (grabOn ? 'вкл' : 'выкл'));
+  // Кнопка обязана отражать ?grab=0, иначе врет с первого кадра.
+  el('btnGrab').textContent = grabOn ? 'Захват вкл' : 'Захват выкл';
 
   syncThree();
   renderer.render(scene, camera);          // первый кадр явно: в --dump-dom rAF не вызывается
