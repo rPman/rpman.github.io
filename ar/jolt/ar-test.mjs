@@ -125,6 +125,95 @@ const driver = `
     ok('торможение гасит движение', vAfter < 0.05,
       'скорость через 1 с после отрыва: ' + vAfter.toFixed(4) + ' м/с (damping 6 1/с)');
 
+    /* --- кисть: 25 суставов на руку (50 сфер) + 2 контроллера ---------------- */
+    H.cfg({ leash: 5 });
+    H.park('torus', 0, 3, 0);
+    H.park('cube', 4, 0, 0);
+    H.park('sphere', 0, 0, 0);
+    var NSLOT = H.info().slots;
+    ok('слотов ввода хватает на две кисти', NSLOT === 52,
+      'слотов ' + NSLOT + ', тел в мире ' + H.info().numBodies);
+
+    // G. «ладонь» — стена из 25 суставов — толкает шарик всей площадью
+    function palm(buf, X) {
+      for (var j = 0; j < 25; j++) {
+        fin(buf, j, X, -0.06 + Math.floor(j / 5) * 0.03, -0.06 + (j % 5) * 0.03);
+      }
+      for (var j2 = 25; j2 < NSLOT; j2++) off(buf, j2);
+    }
+    var px = 0.22, touched = 0, x0 = H.body('sphere').x;
+    for (var g = 0; g < 160; g++) {
+      px -= 0.002;
+      var ig = one(function (buf) { palm(buf, px); });
+      if (ig.contacts > 0) touched++;
+    }
+    var sx = H.body('sphere').x;
+    ok('ладонь из 25 суставов толкает шарик', touched > 0 && sx < x0 - 0.05,
+      'кадров с контактом ' + touched + ' из 160, шарик с ' + x0.toFixed(3) + ' до ' +
+      sx.toFixed(3) + ' м');
+
+    // H. две кисти внахлёст: пара рука↔рука выключена в фильтре пар, иначе 50 суставов
+    // начали бы генерировать манifold'ы на каждом кадре
+    H.park('sphere', -4, 0, 0);
+    var hc = 0, drift = 0;
+    for (var h = 0; h < 60; h++) {
+      var ih = one(function (buf) {
+        for (var i = 0; i < 50; i++) fin(buf, i, 0.5, 0, 0);
+        for (var c = 50; c < NSLOT; c++) off(buf, c);
+      });
+      hc = Math.max(hc, ih.contacts);
+      for (var q = 0; q < 50; q++) drift = Math.max(drift, Math.abs(ih.fingers[q].x - 0.5));
+    }
+    ok('50 перекрывающихся суставов: слой рука<->рука выключен', hc === 0 && drift < 1e-3,
+      'контактов ' + hc + ', разнос максимум ' + drift.toExponential(1) + ' м');
+
+    // I. радиус сустава = радиус коллизии: форма обязана пересобираться под него
+    H.park('torus', 0, 0, 0);
+    var rx = -0.55, gapR = null;
+    for (var i2 = 0; i2 < 700 && gapR === null; i2++) {
+      rx += 0.001;
+      var ii = one(function (buf) {
+        buf[0] = rx; buf[1] = 0; buf[2] = 0; buf[3] = 0.030;
+        for (var c2 = 1; c2 < NSLOT; c2++) off(buf, c2);
+      });
+      if (ii.contacts > 0) gapR = H.body('torus').x - ii.fingers[0].x;
+    }
+    ok('радиус сустава идёт в форму (r = 30 мм)',
+      gapR !== null && Math.abs(gapR - (R + tube + 0.03 + PAD)) < 0.004,
+      gapR === null ? 'контакта нет' : 'зазор=' + gapR.toFixed(4) +
+        ' истина=' + (R + tube + 0.03 + PAD).toFixed(4) + ' (граница формы + handPad)');
+
+    // J. полный скелет обеих кистей: 72 шага, все 52 сферы живые, три фигуры на месте.
+    // Про часов тут нет: в --dump-dom виртуальное время внутри синхронного цикла не идёт
+    // (=0 мс на любой работе), поэтому цена шага меряется живым браузером в cdp.mjs.
+    H.park('sphere', 0, 0, 0);
+    H.park('torus', 0, 3, 0);
+    H.park('cube', 0, -3, 0);
+    var touchAll = 0, maxV = 0;
+    for (var k2 = 0; k2 < 72; k2++) {
+      H.step(1, function (buf) {
+        // Две «ладони» лицом к шарику: слоты 0..24 слева, 25..49 справа, контроллеры выключены.
+        for (var i3 = 0; i3 < 50; i3++) {
+          var side = i3 < 25 ? -1 : 1, j = i3 % 25;
+          fin(buf, i3, side * (0.10 - k2 * 0.002), -0.06 + ((j / 5) | 0) * 0.03,
+            -0.06 + (j % 5) * 0.03);
+        }
+      });
+      var sk = H.info().bodies.filter(function (q) { return q.id === 'sphere'; })[0];
+      if (sk.contacts > 0) touchAll++;
+      maxV = Math.max(maxV, sk.speed);
+    }
+    var skInf = H.info().bodies, worstLeash = 0;
+    for (var s2 = 0; s2 < skInf.length; s2++) {
+      worstLeash = Math.max(worstLeash, skInf[s2].leash);
+      if (!isFinite(skInf[s2].x) || !isFinite(skInf[s2].y) || !isFinite(skInf[s2].z)) maxV = NaN;
+    }
+    ok('полный скелет двух кистей (50 суставов) гоняется 72 шага',
+      touchAll > 20 && isFinite(maxV) && worstLeash <= LEASH + 1e-3 && H.diag().errs.length === 0,
+      'кадров с контактом ' + touchAll + ' из 72, скорость шарика максимум ' + maxV.toFixed(3) +
+      ' м/с, поводок выдержан до ' + worstLeash.toFixed(3) + ' м при лимите ' + LEASH +
+      ', ошибок ' + H.diag().errs.length);
+
     // E. place() — «перед собой»: якоря и тела совпадают
     H.place();
     var inf2 = H.info(), worst = 0;
@@ -294,6 +383,24 @@ if (!rep.info0 || rep.info0.numBodies < 5 || rep.info0.bodies.length !== 3) {
   fails++;
 } else console.log('ok   мир собран: тел ' + rep.info0.numBodies + ', фигур ' + rep.info0.bodies.length);
 
+/* Дамп DOM в headless приходит, когда исчерпан виртуальный бюджет, а не когда драйвер дописал
+ * отчёт: отчёт иногда обрывается посреди JSON («Unexpected end of JSON input»). Дамп
+ * переигрывается, пока в `<pre id="report">` не окажется завершённый объект. */
+async function dumpTry(path, budget, attempts) {
+  let last = '';
+  for (let a = 0; a < attempts; a++) {
+    const dom = await chrome(['--virtual-time-budget=' + budget, '--dump-dom', base + path]);
+    last = dom;
+    const m = dom.match(/<pre id="report"[^>]*>([\s\S]*?)<\/pre>/);
+    if (!m || !m[1].trim()) continue;                 // драйвер ещё молчит
+    if (/^\s*\{/.test(m[1])) {
+      try { parseReport(dom); return dom; } catch (e) { continue; }  // JSON оборван
+    }
+    return dom;                                       // текстовый отчёт готов
+  }
+  return last;
+}
+
 for (const [pg, png, budget] of [['/ar-jolt-ar.html', 'ar_start.png', 20000],
                                  ['/ar-shot.html', 'ar_ball_in_ring.png', 70000]]) {
   try {
@@ -308,7 +415,7 @@ for (const [pg, png, budget] of [['/ar-jolt-ar.html', 'ar_start.png', 20000],
   }
 }
 try {
-  const shotDom = await chrome(['--virtual-time-budget=25000', '--dump-dom', base + '/ar-shot.html']);
+  const shotDom = await dumpTry('/ar-shot.html', 25000, 3);
   const shotErr = shotDom.match(/<pre id="shotError"[^>]*>([\s\S]*?)<\/pre>/);
   if (shotErr) { console.log('FAIL кадр превью бросает исключение: ' + shotErr[1]); fails++; }
   else console.log('боевой кадр: в цикле.setAnimationLoop исключений нет');
@@ -326,7 +433,7 @@ try {
 }
 
 try {
-  const diagDom = await chrome(['--virtual-time-budget=40000', '--dump-dom', base + '/ar-diag.html']);
+  const diagDom = await dumpTry('/ar-diag.html', 40000, 3);
   const drep = parseReport(diagDom);
   if (!drep) { console.log('FAIL диагностика кадра ничего не сообщила'); fails++; }
   else {

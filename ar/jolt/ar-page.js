@@ -29,10 +29,36 @@ const FIGS = [
 const LATERAL = [-0.28, 0.00, 0.30];      // м вдоль «вправо» от точки появления
 const MAX_SPEED = 2.5, MAX_SPIN = 10;
 const DAMP = 6, DAMP_A = 6;               // v *= 1/(1+d*dt) за шаг: ~1 с до остановки
-const SLOTS = 2;                          // 0 = левая рука/контроллер, 1 = правая
+
+/* Порядок суставов кисти фиксирован спекой WebXR Hand Input: wrist, затем большой (без
+ * intermediate) и по пять на остальные пальцы. Индекс слота = base + позиция в этом списке,
+ * поэтому руки между собой не путаются и тесты ссылаются на сустав по номеру. */
+const JOINT_ORDER = ['wrist',
+  'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+  'index-metacarpal', 'index-phalanx-proximal', 'index-phalanx-distal',
+  'index-phalanx-intermediate', 'index-tip',
+  'middle-metacarpal', 'middle-phalanx-proximal', 'middle-phalanx-distal',
+  'middle-phalanx-intermediate', 'middle-tip',
+  'ring-metacarpal', 'ring-phalanx-proximal', 'ring-phalanx-distal',
+  'ring-phalanx-intermediate', 'ring-tip',
+  'pinky-metacarpal', 'pinky-phalanx-proximal', 'pinky-phalanx-distal',
+  'pinky-phalanx-intermediate', 'pinky-tip'];
+const HAND_SLOTS = JOINT_ORDER.length;    // 25
+const INDEX_TIP = 9;
+const handSlot = (side, j) => side * HAND_SLOTS + j;
+const CTRL_SLOT = 2 * HAND_SLOTS;         // 50, 51 — контроллеры, когда руки не читаются
+const MAX_SLOTS = 2 * HAND_SLOTS + 2;     // 52 кинематических сферы максимум
+
+/* Query-параметры — единственный способ переключать режим в шлеме: на PICO 4 Ultra
+ * dom-overlay не выдаётся (start|feat=…|ovl=нет), так что кнопок HUD в AR не видно. */
+const QS = new URLSearchParams(location.search);
+let handsMode = QS.get('hands') === 'index' ? 'index' : 'full';
+let showHands = QS.get('proxy') !== '0';
+
 const MIN_JOINT_R = 0.004, MAX_JOINT_R = 0.03, FINGER_R0 = 0.011, PAD_R = 0.020;
 const BEACON = 'https://yokko.duckdns.org/ar-ht/rep.gif';
-let leashMeters = 0.9;
+let leashMeters = isFinite(+QS.get('leash')) && +QS.get('leash') > 0 ? +QS.get('leash') : 0.9;
+let beaconOn = !QS.has('nobeacon');
 
 const el = (id) => document.getElementById(id);
 const statusEl = el('status'), statEl = el('stat'), noteEl = el('hudNote'), errEl = el('err');
@@ -98,15 +124,18 @@ for (const f of FIGS) {
   scene.add(meshes[f.id]);
 }
 
-/* Прокси пальцев: видно, куда физика поставила сферу вместо сустава, и какого она радиуса. */
+/* Прокси приводных сфер: видно, куда физика поставила сферу вместо сустава, и какой у неё
+ * радиус. 52 экземпляра: 25 на кисть + 2 контроллера. */
 const handMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 16, 12),
-  new THREE.MeshBasicMaterial({ color: 0x63c8ff, transparent: true, opacity: 0.35 }), SLOTS);
+  new THREE.MeshBasicMaterial({ color: 0x63c8ff, transparent: true, opacity: 0.35 }), MAX_SLOTS);
 handMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-handMesh.count = SLOTS;
+handMesh.count = MAX_SLOTS;
 scene.add(handMesh);
 
 const touchMeshes = [];
-for (let i = 0; i < 24; i++) {
+// 48 маркеров: кисть из 25 сфер легко даёт больше контактов, чем 24, а молча не дорисованные
+// точки выглядят как расходимость чисел в HUD.
+for (let i = 0; i < 48; i++) {
   const m = new THREE.Mesh(new THREE.SphereGeometry(0.004, 8, 6),
     new THREE.MeshBasicMaterial({ color: 0xff3355 }));
   m.visible = false;
@@ -121,14 +150,29 @@ const bodies = new Map();
 const anchors = new Map();
 const bodyIds = [];                          // параллельно bodiesList: обход по индексу
 const bodiesList = [];
-const fingers = [];
-const slotR = new Array(SLOTS).fill(FINGER_R0);
+const fingers = [];                        // имя старше идеи: теперь это 25 сфер на кисть + контроллеры
+const slotR = new Array(MAX_SLOTS).fill(FINGER_R0);
+const shapesByR = new Map();               // радиус (мм) → сфера: кисти меняют радиус, а форма одна на всех
 let frameContacts = [];
 
 function shapeFor(J, f) {
   if (f.id === 'sphere') return sphereShape(J, alive, f.r);
   if (f.id === 'cube') return boxShape(J, alive, f.half);
   return torusShape(J, alive, f.R, f.tube, f.seg);
+}
+
+/* Сферы суставов квантуются по 1 мм и переиспользуются: у 50 кинематических сфер радиус
+ * меняется постоянно, а new SphereShape на каждый кадр = тысячи wasm-объектов в минуту.
+ * Формы обязаны жить в alive: Jolt держит на них сырые указатели. */
+function sphereFor(J, r) {
+  const key = Math.round(r * 1000);
+  let sh = shapesByR.get(key);
+  if (!sh) {
+    sh = new J.SphereShape(key / 1000);
+    alive.push(sh);
+    shapesByR.set(key, sh);
+  }
+  return sh;
 }
 
 async function boot() {
@@ -152,15 +196,15 @@ async function boot() {
     bodies.set(f.id, id);
     anchors.set(f.id, { x: 0, y: 0, z: 0 });
   }
-  for (let i = 0; i < SLOTS; i++) {
-    fingers.push(addBody(Jolt, bi, bodySettings(Jolt, sphereShape(Jolt, alive, FINGER_R0),
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    fingers.push(addBody(Jolt, bi, bodySettings(Jolt, sphereFor(Jolt, FINGER_R0),
       -3, 0, 0, Jolt.EMotionType_Kinematic, L_HAND)));
   }
 
   placeRow(0, 0, 0, 1, 0, null);           // ряд вдоль X: шар, кольцо, куб
   for (const [id, b] of bodies) { bodyIds.push(id); bodiesList.push(b); }
   say('jolt ok: тел ' + ps.GetNumBodies() + ', бублик = ' + FIGS[1].seg + ' капсул, damping ' +
-    DAMP + ', leash ' + leashMeters + ' м');
+    DAMP + ', leash ' + leashMeters + ' м, рук по ' + HAND_SLOTS + ' суставов, режим ' + handsMode);
 
   syncThree();
   renderer.render(scene, camera);          // первый кадр явно: в --dump-dom rAF не вызывается
@@ -224,13 +268,12 @@ function drive(slot, x, y, z) {            // кинематика: ТОЛЬКО
 function stop(slot) { bi.SetLinearVelocity(fingers[slot], V(0, 0, 0)); }
 
 /* Радиус сустава = радиус коллизии. Форму пересобираем редко: только если палец изменился
- * больше чем на 2 мм (SetShape на каждом кадре перекладывает тело в broadphase). */
+ * больше чем на 2 мм (SetShape на каждом кадре перекладывает тело в broadphase), и берём её
+ * из кеша по кванту 1 мм. */
 function setRadius(slot, r) {
   if (!isFinite(r) || r <= 0 || Math.abs(r - slotR[slot]) < 0.002) return;
   slotR[slot] = r;
-  const sh = new Jolt.SphereShape(r);
-  alive.push(sh);
-  bi.SetShape(fingers[slot], sh, true, Jolt.EActivate_Activate);
+  bi.SetShape(fingers[slot], sphereFor(Jolt, r), true, Jolt.EActivate_Activate);
 }
 
 /* Ни один удар не должен уносить фигуру за экран: пружина здесь не нужна, достаточно
@@ -259,17 +302,20 @@ function leash() {
   return over;
 }
 
+const driveBuf = new Float32Array(MAX_SLOTS * 4);
 function stepPhysics(n, fill) {
   let over = 0;
   for (let k = 0; k < n; k++) {
     frameContacts.length = 0;
     if (fill) {
-      const buf = new Float32Array(SLOTS * 4);
-      fill(buf);
-      for (let i = 0; i < SLOTS; i++) {
-        if (!isFinite(buf[i * 4])) { stop(i); continue; }
-        setRadius(i, buf[i * 4 + 3]);
-        drive(i, buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2]);
+      // Не заполненный слот = ВЫКЛЮЧЕН, а не «ноль»: иначе 50 незаполненных суставов
+      // поехали бы в (0,0,0) и смяли фигуру в центре ряда.
+      driveBuf.fill(NaN);
+      fill(driveBuf);
+      for (let i = 0; i < MAX_SLOTS; i++) {
+        if (!isFinite(driveBuf[i * 4])) { stop(i); continue; }
+        setRadius(i, driveBuf[i * 4 + 3]);
+        drive(i, driveBuf[i * 4], driveBuf[i * 4 + 1], driveBuf[i * 4 + 2]);
       }
     }
     ji.Step(DT, 1);
@@ -279,33 +325,86 @@ function stepPhysics(n, fill) {
 }
 
 /* --------------------------------------------------- ввод: руки/контроллеры */
-let handsSeen = 0, padSeen = 0, srcNote = '—', showHands = true;
+let handsSeen = 0, padSeen = 0, jointsLive = 0, srcNote = '—';
 const targets = [];
-for (let i = 0; i < SLOTS; i++) targets.push({ x: -3, y: 0, z: 0, r: FINGER_R0, live: false });
+for (let i = 0; i < MAX_SLOTS; i++) targets.push({ x: -3, y: 0, z: 0, r: FINGER_R0, live: false });
 
 const clampR = (r) => (isFinite(r) ? Math.min(MAX_JOINT_R, Math.max(MIN_JOINT_R, r)) : FINGER_R0);
 
-/* Приоритет у руки: на Quest при включённом hand tracking контроллер в том же слоте исчезает.
- * Позы читаем напрямую из XRInputSource: индекс контроллера в three привязан к порядку
- * inputSources и легко разъезжается, а source всегда под рукой. */
+/* Списки XRJointSpace кэшируются на объект XRInputSource: hand.values() каждый кадр даёт новый
+ * итератор, а fillPoses/fillJointRadii требуют iterable и обязаны увидеть ОДИН и тот же порядок
+ * (он фиксирован спекой). */
+const handCache = new WeakMap();
+function handSpaces(s) {
+  let h = handCache.get(s);
+  if (!h) {
+    let spaces = [];
+    try {
+      for (const [, space] of s.hand) spaces.push(space);   // порядок по спеке
+    } catch (e) {
+      spaces = [];                                          // runtime без итератора XRHand
+    }
+    if (spaces.length !== HAND_SLOTS) {
+      // Порядок задаём сами по JOINT_ORDER — он и есть спековый.
+      spaces = JOINT_ORDER.map((n) => s.hand.get(n)).filter(Boolean);
+    }
+    h = { spaces };
+    handCache.set(s, h);
+  }
+  return h;
+}
+
+const pose16 = new Float32Array(16 * HAND_SLOTS);   // матрицы column-major: перевод в 12..14
+const radii25 = new Float32Array(HAND_SLOTS);
+
+/* Одна кисть = 25 приводных сфер. Быстрый путь (fillPoses + fillJointRadii) отказывает на ВСЮ
+ * кисть, если не оттрекан хоть один сустав, поэтому есть запасной путь поштучно. */
+function readHand(s, side, frame, refSpace) {
+  const h = handSpaces(s);
+  const onlyTip = handsMode === 'index';
+  let n = 0, fast = false;
+  try {
+    fast = frame.fillPoses(h.spaces, refSpace, pose16) !== false &&
+      frame.fillJointRadii(h.spaces, radii25) !== false;
+  } catch (e) { fast = false; }
+  for (let j = 0; j < h.spaces.length; j++) {
+    if (onlyTip && j !== INDEX_TIP) continue;
+    let x, y, z, r;
+    if (fast) {
+      const o = j * 16;
+      x = pose16[o + 12]; y = pose16[o + 13]; z = pose16[o + 14]; r = radii25[j];
+    } else {
+      let jp = null;
+      try { jp = frame.getJointPose(h.spaces[j], refSpace); } catch (e) { jp = null; }
+      if (!jp) continue;
+      const p = jp.transform.position;
+      x = p.x; y = p.y; z = p.z; r = jp.radius;
+    }
+    if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+    const t = targets[handSlot(side, j)];
+    t.x = x; t.y = y; t.z = z; t.r = clampR(r); t.live = true;
+    n++;
+  }
+  return n;
+}
+
+/* Приоритет у руки: при включённом hand tracking контроллер в том же слоте исчезает. Позы
+ * читаем напрямую из XRInputSource: индекс контроллера в three привязан к порядку inputSources
+ * и легко разъезжается, а source всегда под рукой. */
 function readInputs(frame, refSpace) {
-  handsSeen = 0; padSeen = 0;
-  const src = frame.session.inputSources, note = [];
+  handsSeen = 0; padSeen = 0; jointsLive = 0;
+  const src = frame.session.inputSources, note = [], taken = [false, false];
   for (const g of targets) g.live = false;
   for (let i = 0; i < src.length; i++) {
     const s = src[i];
-    const slot = s.handedness === 'left' ? 0 : s.handedness === 'right' ? 1 : (i % SLOTS);
-    const t = targets[slot];
-    const tag = (s.handedness === 'left' ? 'L' : 'R');
+    const side = s.handedness === 'right' ? 1 : 0;
+    const tag = side ? 'R' : 'L';
+    if (taken[side]) continue;             // третий inputSource в этой сцене не modeled
     if (s.hand) {
-      const space = s.hand.get('index-tip') || s.hand.get('index-distal');
-      let jp = null;
-      try { jp = space ? frame.getJointPose(space, refSpace) : null; } catch (e) { jp = null; }
-      if (jp) {
-        handsSeen++;
-        note.push(tag + 'рука');
-        t.x = jp.transform.position.x; t.y = jp.transform.position.y; t.z = jp.transform.position.z;
-        t.r = clampR(jp.radius); t.live = true;
+      const n = readHand(s, side, frame, refSpace);
+      if (n) {
+        taken[side] = true; handsSeen++; jointsLive += n;
+        note.push(tag + 'рука' + n);
         continue;
       }
     }
@@ -313,9 +412,9 @@ function readInputs(frame, refSpace) {
     let pose = null;
     try { pose = space ? frame.getPose(space, refSpace) : null; } catch (e) { pose = null; }
     if (pose) {
-      padSeen++;
+      taken[side] = true; padSeen++;
       note.push(tag + 'контроллер');
-      const q = pose.transform.position;
+      const t = targets[CTRL_SLOT + side], q = pose.transform.position;
       t.x = q.x; t.y = q.y; t.z = q.z; t.r = PAD_R; t.live = true;
     }
   }
@@ -325,6 +424,7 @@ function readInputs(frame, refSpace) {
 /* Превью без шлема: курсор задаёт ЛЕВЫЙ палец в плоскости через кольцо. Объёма здесь нет —
  * это только проверка физики, вхожения шарика в кольцо тут не получится. */
 const ptr = { x: 0, y: 0, has: false, usedX: 0, usedY: 0, applied: 0 };
+const PTR_SLOT = handSlot(0, INDEX_TIP);   // курсор = кончик указательного левой кисти
 const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
 const plane = new THREE.Plane(), hit = new THREE.Vector3(), viewDir = new THREE.Vector3();
 function readPointer() {
@@ -337,7 +437,7 @@ function readPointer() {
   ndc.set(ptr.x, ptr.y);
   ray.setFromCamera(ndc, camera);
   if (!ray.ray.intersectPlane(plane, hit)) return;
-  const t = targets[0];
+  const t = targets[PTR_SLOT];
   t.x = hit.x; t.y = hit.y; t.z = hit.z; t.r = FINGER_R0; t.live = true;
   ptr.usedX = ptr.x; ptr.usedY = ptr.y; ptr.applied++;
 }
@@ -346,7 +446,9 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   ptr.y = -(e.clientY / window.innerHeight) * 2 + 1;
   ptr.has = true;
 });
-renderer.domElement.addEventListener('pointerleave', () => { ptr.has = false; targets[0].live = false; });
+renderer.domElement.addEventListener('pointerleave', () => {
+  ptr.has = false; targets[PTR_SLOT].live = false;
+});
 
 /* ------------------------------------------------------------- отрисовка */
 const mtx = new THREE.Matrix4(), q0 = new THREE.Quaternion(), vp = new THREE.Vector3(), vs = new THREE.Vector3();
@@ -362,9 +464,12 @@ function syncThree() {
     m.position.set(p.x, p.y, p.z);
     m.quaternion.set(q.GetX(), q.GetY(), q.GetZ(), q.GetW());
   }
-  for (let i = 0; i < SLOTS; i++) {
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    // Рисуем только отслеженные суставы: все 52 тела на старте стоят в (-3,0,0), и без этого
+    // условия в кадре был бы пучок из 52 сфер.
+    if (!showHands || !targets[i].live) { setInstance(i, 0, -100, 0, 0); continue; }
     const p = posOf(fingers[i]);
-    setInstance(i, p.x, p.y, p.z, showHands ? slotR[i] + HAND_PAD * 0.5 : 0);
+    setInstance(i, p.x, p.y, p.z, slotR[i] + HAND_PAD * 0.5);
   }
   handMesh.instanceMatrix.needsUpdate = true;
   for (let i = 0; i < touchMeshes.length; i++) {
@@ -375,7 +480,7 @@ function syncThree() {
 }
 
 /* ------------------------------------------------------- отладочный луч */
-let beaconOn = true, seq = 0, sent = 0;
+let seq = 0, sent = 0;                    // beaconOn объявлен рядом с настройками
 function beacon(line) {
   if (!beaconOn) return;
   new Image().src = BEACON + '?k=arht&i=' + (++seq) + '&d=' + encodeURIComponent(line).slice(0, 700);
@@ -408,7 +513,7 @@ function tick(time, frame) {
     const s0 = performance.now();
     for (let s = 0; s < steps; s++) {
       maxOver = stepPhysics(1, (buf) => {
-        for (let i = 0; i < SLOTS; i++) {
+        for (let i = 0; i < MAX_SLOTS; i++) {
           const g = targets[i];
           buf[i * 4] = g.live ? g.x : NaN;
           buf[i * 4 + 1] = g.live ? g.y : 0;
@@ -437,24 +542,38 @@ function tick(time, frame) {
 
 function updateStat() {
   statEl.textContent = 'fps ' + fps.toFixed(0) + ' · шаг ' + stepMs.toFixed(1) + ' мс · кадр ' +
-    frameMs.toFixed(1) + ' мс · рук ' + handsSeen + ' · контроллеров ' + padSeen +
-    ' · контактов ' + frameContacts.length + ' · v ' + maxSpeed.toFixed(2) + ' м/с' +
+    frameMs.toFixed(1) + ' мс · рук ' + handsSeen + ' (' + jointsLive + ' суставов) · контроллеров ' +
+    padSeen + ' · контактов ' + frameContacts.length + ' · v ' + maxSpeed.toFixed(2) + ' м/с' +
     (maxOver > 0.001 ? ' · leash вжата +' + maxOver.toFixed(3) + ' м' : '') +
     ' · отправлено ' + sent;
 }
 
+/* Joint-сводка, а не список из 52 радиусов: строка луча упирается в длину URL. */
+function jointStats() {
+  let n = 0, lo = 99, hi = 0;
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    if (!targets[i].live) continue;
+    n++;
+    lo = Math.min(lo, slotR[i]); hi = Math.max(hi, slotR[i]);
+  }
+  return { n, lo: n ? lo : 0, hi };
+}
+
 function perfLine() {
+  const j = jointStats();
   return ['f' + fps.toFixed(0), 'step' + stepMs.toFixed(1), 'fr' + frameMs.toFixed(1),
     'c' + frameContacts.length, 'v' + maxSpeed.toFixed(2), 'pen' + pen.toFixed(3),
-    'lv' + maxOver.toFixed(3), srcNote.replace(/[ ,]/g, ''),
-    'r' + slotR.map((r) => (r * 1000).toFixed(0)).join('/')].join('|');
+    'lv' + maxOver.toFixed(3), 'j' + j.n + '(' + (j.lo * 1000).toFixed(0) + '-' +
+    (j.hi * 1000).toFixed(0) + 'мм)', srcNote.replace(/[ ,]/g, '')].join('|');
 }
 
 function fullReport() {
+  const j = jointStats();
   return JSON.stringify({
     mode: mode, fps: +fps.toFixed(1), stepMs: +stepMs.toFixed(2), frameMs: +frameMs.toFixed(2),
     contacts: frameContacts.length, v: +maxSpeed.toFixed(3), pen: +pen.toFixed(4),
-    leashOver: +maxOver.toFixed(4), src: srcNote, radii: slotR.map((r) => +r.toFixed(4)),
+    leashOver: +maxOver.toFixed(4), src: srcNote, handsMode: handsMode,
+    joints: j.n, jointRmin: +j.lo.toFixed(4), jointRmax: +j.hi.toFixed(4),
     bodies: bodyIds.map((id, i) => { const p = posOf(bodiesList[i]); return [id, +p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)]; }),
     anchors: bodyIds.map((id) => { const a = anchors.get(id); return [id, +a.x.toFixed(3), +a.y.toFixed(3), +a.z.toFixed(3)]; }),
     errs: consoleErrs.slice(0, 3),
@@ -481,7 +600,8 @@ function enterAR() {
     setChrome(true, true);
     noteEl.textContent = session.domOverlayState
       ? 'Щипок — перенести фигуры перед собой. Кулак — отладочный отчёт на сервер.'
-      : 'DOM-оверлей не дан: кнопок в шлеме не видно, но жесты работают: щипок — перенести, кулак — отчёт.';
+      : 'DOM-оверлей не дан: кнопок в шлеме не видно, но жесты работают: щипок — перенести, ' +
+        'кулак — отчёт. Режимы (hands=index, proxy=0, leash=…) — в адресной строке.';
 
     session.addEventListener('select', () => placeInFrontOfHead(lastFrame, lastRef));
     session.addEventListener('squeeze', () => beacon('FULL|' + fullReport()));
@@ -514,8 +634,8 @@ el('preview').addEventListener('click', () => {
   mode = 'preview'; placed = true; lastT = 0;
   scene.background = new THREE.Color(0x14161a);
   setChrome(true, false);
-  noteEl.textContent = 'Мышь = один палец в плоскости. Это превью: объёма тут нет, шарик в кольцо ' +
-    'входит только в AR.';
+  noteEl.textContent = 'Мышь = кончик указательного пальца левой кисти, и только в плоскости. ' +
+    'Это превью: объёма тут нет, шарик в кольцо входит в AR, где кисть даёт 25 суставов.';
 });
 el('btnReset').addEventListener('click', () => placeInFrontOfHead(lastFrame, lastRef));
 el('btnHands').addEventListener('click', () => { showHands = !showHands; });
@@ -557,7 +677,8 @@ window.__ja = {
     for (const c of frameContacts) if (c.pen > penMax) penMax = c.pen;
     const fin = fingers.map((f, i) => { const p = posOf(f); return { i, x: p.x, y: p.y, z: p.z, r: slotR[i] }; });
     return { mode, bodies: list, fingers: fin, contacts: frameContacts.length, pen: penMax,
-      hands: handsSeen, pads: padSeen, numBodies: ps.GetNumBodies(), radii: slotR.slice(),
+      hands: handsSeen, pads: padSeen, joints: jointsLive, slots: MAX_SLOTS,
+      handsMode: handsMode, numBodies: ps.GetNumBodies(), radii: slotR.slice(),
       leash: leashMeters };
   },
   step(n, fill) { for (let k = 0; k < n; k++) maxOver = stepPhysics(1, fill); syncThree(); },
@@ -578,10 +699,12 @@ window.__ja = {
     if (o.handPad !== undefined) setSpeculative(ps, o.handPad);
     if (o.beacon !== undefined) beaconOn = !!o.beacon;
     if (o.leash !== undefined) leashMeters = o.leash;
+    if (o.hands !== undefined) handsMode = o.hands === 'index' ? 'index' : 'full';
+    if (o.proxy !== undefined) showHands = !!o.proxy;
   },
   freeze(v) { frozen = !!v; },
   pointer: () => ({ has: ptr.has, ndc: [ptr.x, ptr.y], used: [ptr.usedX, ptr.usedY],
-    applied: ptr.applied, target: Object.assign({}, targets[0]),
+    applied: ptr.applied, target: Object.assign({}, targets[PTR_SLOT]), slot: PTR_SLOT,
     hit: [+hit.x.toFixed(4), +hit.y.toFixed(4), +hit.z.toFixed(4)],
     normal: [plane.normal.x, plane.normal.y, plane.normal.z],
     constant: plane.constant, rayO: ray.ray.origin.toArray(), rayD: ray.ray.direction.toArray(),

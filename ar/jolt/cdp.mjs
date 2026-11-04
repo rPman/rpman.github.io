@@ -142,6 +142,29 @@ if (ready === 'ready') {
       calls: d1.calls, tris: d1.tris, perf: window.__ja.perf() };
   })()`, true);
   console.log('кадры: ' + JSON.stringify(fps));
+
+  /* Цена шага с полным скелетом. В headless это не померить: --dump-dom живёт на виртуальном
+   * времени, и внутри синхронного цикла часы стоят (люббая работа = 0 мс). Здесь часы настоящие. */
+  const cost = await evalJs(`(() => {
+    const N = 360, H = window.__ja;
+    H.park('sphere', 0, 0, 0); H.park('torus', 0, 3, 0); H.park('cube', 0, -3, 0);
+    // Ладони вплотную к шарику (0.05 = r шара 0.035 + r сустава 0.011 + зазор 0.004), чтобы
+    // narrowphase реально держала манifold'ы: на пустом мире цифра цены шага занижена.
+    const fill = (buf) => {
+      for (let i = 0; i < 50; i++) {
+        const side = i < 25 ? -1 : 1, j = i % 25;
+        buf[i * 4] = side * 0.05; buf[i * 4 + 1] = -0.06 + ((j / 5) | 0) * 0.03;
+        buf[i * 4 + 2] = -0.06 + (j % 5) * 0.03; buf[i * 4 + 3] = 0.011;
+      }
+    };
+    H.step(20, fill);                       // прогрев: первые шаги включают wasm-пути
+    const t0 = performance.now();
+    H.step(N, fill);
+    const ms = performance.now() - t0;
+    return { шагов: N, всего_мс: +ms.toFixed(1), мс_на_шаг: +(ms / N).toFixed(4),
+      бюджет_кадра_мс: +(1000 / 72).toFixed(2), in_loop_perf: H.perf() };
+  })()`);
+  console.log('шаг: ' + JSON.stringify(cost));
 }
 
 if (expr) console.log('eval: ' + JSON.stringify(await evalJs(expr, true), null, 1));
