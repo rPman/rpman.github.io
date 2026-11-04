@@ -425,6 +425,47 @@ const torus32 = torusShape(32);
   drop(fig.id);
 }
 
+// ---- 12. захват: SetMotionType и кинематическое вращение ----------------
+// Захват решено держать так: на время захвата фигура становится КИНЕМАТИЧЕСКОЙ и едет за
+// кадром захвата (линейная + угловая скорость). Здесь проверяется всё, на чём это стоит.
+{
+  ok('у BodyInterface есть SetMotionType(id, motion, activation) — перевод фигуры в кинематику',
+    typeof bi.SetMotionType === 'function' && typeof bi.GetMotionType === 'function',
+    'SetMotionType: ' + typeof bi.SetMotionType + ', GetMotionType: ' + typeof bi.GetMotionType);
+
+  const held = add(sphere(0.035), 0, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE);
+  bi.SetMotionType(held, Jolt.EMotionType_Kinematic, Jolt.EActivate_Activate);
+  bi.SetLinearVelocity(held, V(0.3, 0, 0));
+  bi.SetAngularVelocity(held, V(0, 0, 2));
+  for (let f = 0; f < 72; f++) step();                 // ровно одна секунда
+  const p = pos(held), q = bi.GetRotation(held);
+  const ang = 2 * Math.acos(Math.min(1, Math.abs(q.GetW())));
+  ok('кинематическое тело интегрирует и линейную, и угловую скорость — поворот захвата есть',
+    near(p.x, 0.3, 0.01) && near(ang, 2, 0.05),
+    'x=' + p.x.toFixed(4) + ' (ждали 0.300), поворот ' + ang.toFixed(3) + ' рад (ждали 2.000)');
+
+  // Держать придётся ГЕОМЕТРИЕЙ: палец (кинематический) и удерживаемая фигура (тоже
+  // кинематическая) контактов не дают вовсе.
+  const finger = add(sphere(FINGER_R), pos(held).x - (0.035 + FINGER_R), 0, 0,
+    Jolt.EMotionType_Kinematic, L_HAND);
+  step();
+  ok('удерживаемая фигура с пальцем не контактирует: kinematic<->kinematic контактов нет',
+    !touching(held, finger),
+    'палец впритык (|dx|=' + Math.abs(pos(held).x - pos(finger).x).toFixed(4) +
+    '), контактов ' + contactsOf(held, finger).length);
+  drop(finger);
+
+  bi.SetMotionType(held, Jolt.EMotionType_Dynamic, Jolt.EActivate_Activate);
+  const vKeep = speedOf(held);
+  bi.SetLinearVelocity(held, V(0.3, 0, 0));             // на отпускании скорость ставим сами
+  for (let f = 0; f < 72; f++) step();
+  const p2 = pos(held);
+  ok('обратно в динамик тело продолжает лететь — бросок работает',
+    p2.x - p.x > 0.25, 'скорость сразу после перехода ' + vKeep.toFixed(3) + ' м/с, пролетело ещё ' +
+    (p2.x - p.x).toFixed(3) + ' м за 1 с');
+  drop(held);
+}
+
 // ---- 11. мир переиспользуется (Н3) ---------------------------------------
 ok('мир переиспользуется: тела добавляются и удаляются без нового мира',
   (() => { const a = add(sphere(0.01), 0, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE); drop(a); return true; })(),

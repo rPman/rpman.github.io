@@ -203,8 +203,10 @@ async function boot() {
 
   placeRow(0, 0, 0, 1, 0, null);           // ряд вдоль X: шар, кольцо, куб
   for (const [id, b] of bodies) { bodyIds.push(id); bodiesList.push(b); }
+  indexContactKeys();                      // контакты приходят ключами тел
   say('jolt ok: тел ' + ps.GetNumBodies() + ', бублик = ' + FIGS[1].seg + ' капсул, damping ' +
-    DAMP + ', leash ' + leashMeters + ' м, рук по ' + HAND_SLOTS + ' суставов, режим ' + handsMode);
+    DAMP + ', leash ' + leashMeters + ' м, рук по ' + HAND_SLOTS + ' суставов, режим ' + handsMode +
+    ', захват ' + (grabOn ? 'вкл' : 'выкл'));
 
   syncThree();
   renderer.render(scene, camera);          // первый кадр явно: в --dump-dom rAF не вызывается
@@ -282,6 +284,7 @@ function setRadius(slot, r) {
 function leash() {
   let over = 0;
   for (let i = 0; i < bodiesList.length; i++) {
+    if (grabbed.has(bodyIds[i])) continue;   // удерживаемую фигуру ведёт рука, не поводок
     const b = bodiesList[i], an = anchors.get(bodyIds[i]);
     const p = posOf(b);
     const dx = p.x - an.x, dy = p.y - an.y, dz = p.z - an.z;
@@ -303,10 +306,240 @@ function leash() {
 }
 
 const driveBuf = new Float32Array(MAX_SLOTS * 4);
+
+/* ------------------------------------------------------------------ захват
+ * Предмет держится, когда его с ДВУХ сторон толкают РАЗНЫЕ суставы одной кисти: направления
+ * толкания (нормаль манifold`а: из сустава в точку контакта) противоположны. Это физика
+ * процесса, а не жест: «вектора воздействий пересекаются».
+ *
+ * Как держим: фигура на время захвата становится КИНЕМАТИЧЕСКОЙ и едет за кадром захвата.
+ * Проверено в node (ar/jolt/spike.mjs): кинематическое тело интегрирует и линейную, и
+ * угловую скорость, а обратно в динамику возвращаться умеет. Следствие: во время захвата
+ * контактов палец<->фигура нет вовсе (kinematic<->kinematic), поэтому отпускание судится
+ * ГЕОМЕТРИЕЙ, а не контактами.
+ *
+ * Кадр захвата: центр — средневзвешенный по радиусам центр державших суставов; ориентация —
+ * по главному суставу (самый крупный радиус из державших), его матрица приходит прямо из
+ * fillPoses. Смещение фигуры относительно кадра и её поворот относительно кадра запоминаются.
+ *
+ * Отпускаем, когда захват РАСКРЫЛСЯ: размах державших суставов вырос больше чем на GRAB_OPEN
+ * относительно САМОГО СЖАТОГО кадра за время захвата. Пальцы стоят или сжимаются — держим.
+ * Плюс: живых суставов меньше двух, рука пропала, захват выключен параметром.
+ */
+const GRAB_MIN_JOINTS = 2;       // минимум разных суставов, чтобы держать
+const GRAB_FRAMES = 3;           // сколько кадров подряд условие держится до включения
+const GRAB_OPPOSE = -0.3;        // dot направлений толкания пары: ниже — значит держат с двух сторон
+const GRAB_OPEN = 0.03;          // м: насколько разжались пальцы относительно минимума — отпустить
+const GRAB_LOST = 30;            // кадров без двух живых суставов — отпустить
+const GRAB_MAX_SPAN = 0.20;      // м: размах больше этого — это не захват, а случайные касания
+let grabOn = QS.get('grab') !== '0';
+const grabs = new Map();         // side -> захват (на кисть не больше одного предмета)
+const grabbed = new Set();       // id фигур, которые сейчас держат
+const holdFrames = new Map();    // fig id -> сколько кадров подряд он зажаты (до включения)
+
+// Контакты приходят парами указателей, поэтому нужны ключи тел: key->слот и key->фигура.
+const keyToSlot = new Map(), keyToFig = new Map();
+function indexContactKeys() {
+  keyToSlot.clear(); keyToFig.clear();
+  for (let i = 0; i < fingers.length; i++) keyToSlot.set(fingers[i].GetIndexAndSequenceNumber(), i);
+  for (let i = 0; i < bodyIds.length; i++) keyToFig.set(bodiesList[i].GetIndexAndSequenceNumber(), bodyIds[i]);
+}
+const handOfSlot = (s) => (s < HAND_SLOTS ? 0 : 1);      // контроллеры (50/51) не хватают
+
+/* Кандидаты на захват по контактам ПРЕДЫДУЩЕГО шага: фигура -> {сторона, слоты}. */
+function gripCandidates() {
+  const byFig = new Map();
+  for (const c of frameContacts) {
+    const sa = keyToSlot.get(c.a), sb = keyToSlot.get(c.b);
+    const fa = keyToFig.get(c.a), fb = keyToFig.get(c.b);
+    const slot = sa !== undefined ? sa : sb, fig = sa !== undefined ? fb : fa;
+    if (slot === undefined || fig === undefined || slot >= 2 * HAND_SLOTS) continue;
+    const j = posOf(fingers[slot]);
+    let nx = c.x - j.x, ny = c.y - j.y, nz = c.z - j.z;
+    const d = Math.hypot(nx, ny, nz) || 1;
+    let m = byFig.get(fig);
+    if (!m) { m = new Map(); byFig.set(fig, m); }
+    m.set(slot, [nx / d, ny / d, nz / d]);
+  }
+  const out = [];
+  for (const [fig, m] of byFig) {
+    if (grabbed.has(fig) || m.size < GRAB_MIN_JOINTS) continue;
+    let side = -1, same = true;
+    for (const s of m.keys()) {
+      const sd = handOfSlot(s);
+      if (side < 0) side = sd; else if (sd !== side) same = false;    // разными кистями не держим
+    }
+    if (!same || side < 0 || grabs.has(side)) continue;
+    const arr = [...m.entries()];
+    let opposed = false;
+    for (let i = 0; i < arr.length && !opposed; i++) {
+      for (let j = i + 1; j < arr.length; j++) {
+        const d = arr[i][1][0] * arr[j][1][0] + arr[i][1][1] * arr[j][1][1] + arr[i][1][2] * arr[j][1][2];
+        if (d < GRAB_OPPOSE) { opposed = true; break; }
+      }
+    }
+    if (opposed) out.push({ fig, side, slots: arr.map((e) => e[0]) });
+  }
+  return out;
+}
+
+function gripSpan(slots) {
+  const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+  let live = 0;
+  for (const s of slots) {
+    const t = targets[s];
+    if (!t.live) continue;
+    live++;
+    const v = [t.x, t.y, t.z];
+    for (let k = 0; k < 3; k++) { if (v[k] < lo[k]) lo[k] = v[k]; if (v[k] > hi[k]) hi[k] = v[k]; }
+  }
+  return { span: live ? Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) : 0, live };
+}
+
+const gC = new THREE.Vector3(), gM = new THREE.Matrix4(), gQ = new THREE.Quaternion();
+function gripFrame(g) {
+  let w = 0, live = 0;
+  gC.set(0, 0, 0);
+  for (const s of g.slots) {
+    const t = targets[s];
+    if (!t.live) continue;
+    gC.x += t.x * t.r; gC.y += t.y * t.r; gC.z += t.z * t.r; w += t.r; live++;
+  }
+  if (!live || w <= 0) return null;
+  gC.divideScalar(w);
+  const refT = targets[g.ref] && targets[g.ref].live ? targets[g.ref]
+    : targets[g.slots.find((s) => targets[s].live)];
+  if (!refT) return null;
+  gQ.setFromRotationMatrix(gM.fromArray(refT.m));
+  return { cx: gC.x, cy: gC.y, cz: gC.z, qx: gQ.x, qy: gQ.y, qz: gQ.z, qw: gQ.w, live };
+}
+
+function biggestSlot(slots) {
+  let best = slots[0], r = -1;
+  for (const s of slots) if (slotR[s] > r) { r = slotR[s]; best = s; }
+  return best;
+}
+
+function grabStart(c) {
+  const ref = biggestSlot(c.slots);
+  const fr0 = gripFrame({ slots: c.slots, ref });
+  if (!fr0) return;
+  const b = bodies.get(c.fig), p = posOf(b), q = bi.GetRotation(b);
+  const q0 = new THREE.Quaternion(q.GetX(), q.GetY(), q.GetZ(), q.GetW());
+  const Q0 = new THREE.Quaternion(fr0.qx, fr0.qy, fr0.qz, fr0.qw).invert();
+  const off = new THREE.Vector3(p.x - fr0.cx, p.y - fr0.cy, p.z - fr0.cz).applyQuaternion(Q0);
+  const rot0 = Q0.clone().multiply(q0);
+  // поводок на время захвата считается от точки захвата: иначе рука не донесла бы фигуру
+  anchors.set(c.fig, { x: p.x, y: p.y, z: p.z });
+  bi.SetMotionType(b, Jolt.EMotionType_Kinematic, Jolt.EActivate_Activate);
+  grabbed.add(c.fig);
+  const g = { id: c.fig, side: c.side, slots: c.slots.slice(), ref,
+    off, rot0, spanMin: gripSpan(c.slots).span, lost: 0, lin: null, ang: null };
+  grabs.set(c.side, g);
+  beacon('grab|' + c.fig + '|' + g.slots.length);
+}
+
+function grabEnd(g, why) {
+  const b = bodies.get(g.id);
+  bi.SetMotionType(b, Jolt.EMotionType_Dynamic, Jolt.EActivate_Activate);
+  anchors.set(g.id, posOf(b));                 // полёт после отпускания — от точки отпускания
+  if (g.lin) {
+    bi.SetLinearVelocity(b, V(g.lin[0], g.lin[1], g.lin[2]));
+    bi.SetAngularVelocity(b, V(g.ang[0], g.ang[1], g.ang[2]));
+  }
+  grabbed.delete(g.id); grabs.delete(g.side); holdFrames.delete(g.id);
+  beacon('release|' + g.id + '|' + why);
+}
+
+/* Один кадр захвата: отпустить/довести. Вызывается ВНУТРИ шага, до ji.Step: кинематика
+ * сама интегрирует скорость за шаг, как и пальцы. */
+function grabStep() {
+  for (const [, g] of [...grabs]) {
+    const sp = gripSpan(g.slots);
+    if (sp.live >= GRAB_MIN_JOINTS && sp.span < g.spanMin) g.spanMin = sp.span;
+    if (sp.live < GRAB_MIN_JOINTS) {
+      if (++g.lost > GRAB_LOST) { grabEnd(g, 'lost'); continue; }
+    } else g.lost = 0;
+    if (sp.span > g.spanMin + GRAB_OPEN || sp.span > GRAB_MAX_SPAN + GRAB_OPEN) {
+      grabEnd(g, 'open'); continue;
+    }
+    const fr = gripFrame(g);
+    if (!fr) continue;
+    const Q = new THREE.Quaternion(fr.qx, fr.qy, fr.qz, fr.qw);
+    let tp = g.off.clone().applyQuaternion(Q);
+    tp = { x: fr.cx + tp.x, y: fr.cy + tp.y, z: fr.cz + tp.z };
+    const TQ = Q.clone().multiply(g.rot0);
+    // поводок: рука не уносит фигуру дальше leashMeters от точки захвата
+    const an = anchors.get(g.id);
+    const ddx0 = tp.x - an.x, ddy0 = tp.y - an.y, ddz0 = tp.z - an.z;
+    const da = Math.hypot(ddx0, ddy0, ddz0);
+    if (da > leashMeters) {
+      const k = leashMeters / da;
+      tp = { x: an.x + ddx0 * k, y: an.y + ddy0 * k, z: an.z + ddz0 * k };
+    }
+    const b = bodies.get(g.id), p = posOf(b), q = bi.GetRotation(b);
+    const ddx = tp.x - p.x, ddy = tp.y - p.y, ddz = tp.z - p.z;
+    if (Math.hypot(ddx, ddy, ddz) > 0.25) {      // телепорт, как у пальцев: иначе 200 м/с
+      bi.SetPositionAndRotation(b, V(tp.x, tp.y, tp.z),
+        new Jolt.Quat(TQ.x, TQ.y, TQ.z, TQ.w), Jolt.EActivate_Activate);
+      bi.SetLinearVelocity(b, V(0, 0, 0)); bi.SetAngularVelocity(b, V(0, 0, 0));
+      g.lin = [0, 0, 0]; g.ang = [0, 0, 0];
+      continue;
+    }
+    let vx = ddx / DT, vy = ddy / DT, vz = ddz / DT;
+    const s2 = Math.hypot(vx, vy, vz);
+    if (s2 > MAX_SPEED) { const k = MAX_SPEED / s2; vx *= k; vy *= k; vz *= k; }
+    bi.SetLinearVelocity(b, V(vx, vy, vz));
+    const dq = new THREE.Quaternion(TQ.x, TQ.y, TQ.z, TQ.w)
+      .multiply(new THREE.Quaternion(q.GetX(), q.GetY(), q.GetZ(), q.GetW()).invert());
+    if (dq.w < 0) { dq.x = -dq.x; dq.y = -dq.y; dq.z = -dq.z; dq.w = -dq.w; }
+    const ang = 2 * Math.acos(Math.min(1, dq.w));
+    const sn = Math.sqrt(Math.max(1e-9, 1 - dq.w * dq.w));
+    let wx = dq.x / sn * ang / DT, wy = dq.y / sn * ang / DT, wz = dq.z / sn * ang / DT;
+    const sw = Math.hypot(wx, wy, wz);
+    if (sw > MAX_SPIN) { const k = MAX_SPIN / sw; wx *= k; wy *= k; wz *= k; }
+    bi.SetAngularVelocity(b, V(wx, wy, wz));
+    g.lin = [vx, vy, vz]; g.ang = [wx, wy, wz];
+  }
+}
+
+/* Кандидаты в захват: контакты ПРЕДЫДУЩЕГО шага (их ещё не очистили). Счётчик подряд идущих
+ * кадров нужен, чтобы случайное двойное касание не включало захват. */
+function grabDetect() {
+  const seen = new Set();
+  for (const c of gripCandidates()) {
+    seen.add(c.fig);
+    const n = (holdFrames.get(c.fig) || 0) + 1;
+    holdFrames.set(c.fig, n);
+    if (n >= GRAB_FRAMES && !grabs.has(c.side)) grabStart(c);
+  }
+  for (const id of [...holdFrames.keys()]) {
+    if (!seen.has(id) && !grabbed.has(id)) holdFrames.delete(id);
+  }
+}
+
+/* Состояние захвата для HUD, луча и тестов. */
+function grabState() {
+  return [...grabs.values()].map((g) => {
+    const sp = gripSpan(g.slots);
+    return { id: g.id, side: g.side, slots: g.slots.slice(), ref: g.ref,
+      span: +sp.span.toFixed(4), spanMin: +g.spanMin.toFixed(4), lost: g.lost };
+  });
+}
+
+function fromTargets(buf) {
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    const g = targets[i];
+    buf[i * 4] = g.live ? g.x : NaN;
+    buf[i * 4 + 1] = g.live ? g.y : 0;
+    buf[i * 4 + 2] = g.live ? g.z : 0;
+    buf[i * 4 + 3] = g.r;
+  }
+}
+
 function stepPhysics(n, fill) {
   let over = 0;
   for (let k = 0; k < n; k++) {
-    frameContacts.length = 0;
     if (fill) {
       // Не заполненный слот = ВЫКЛЮЧЕН, а не «ноль»: иначе 50 незаполненных суставов
       // поехали бы в (0,0,0) и смяли фигуру в центре ряда.
@@ -318,6 +551,8 @@ function stepPhysics(n, fill) {
         drive(i, driveBuf[i * 4], driveBuf[i * 4 + 1], driveBuf[i * 4 + 2]);
       }
     }
+    if (grabOn) { grabDetect(); grabStep(); }
+    frameContacts.length = 0;
     ji.Step(DT, 1);
     over = Math.max(over, leash());
   }
@@ -327,7 +562,11 @@ function stepPhysics(n, fill) {
 /* --------------------------------------------------- ввод: руки/контроллеры */
 let handsSeen = 0, padSeen = 0, jointsLive = 0, srcNote = '—';
 const targets = [];
-for (let i = 0; i < MAX_SLOTS; i++) targets.push({ x: -3, y: 0, z: 0, r: FINGER_R0, live: false });
+const IDENT16 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+for (let i = 0; i < MAX_SLOTS; i++) {
+  // m — полная матрица сустава (column-major, как в XR): захват по ней поворачивает предмет.
+  targets.push({ x: -3, y: 0, z: 0, r: FINGER_R0, live: false, m: new Float32Array(IDENT16) });
+}
 
 const clampR = (r) => (isFinite(r) ? Math.min(MAX_JOINT_R, Math.max(MIN_JOINT_R, r)) : FINGER_R0);
 
@@ -383,6 +622,13 @@ function readHand(s, side, frame, refSpace) {
     if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
     const t = targets[handSlot(side, j)];
     t.x = x; t.y = y; t.z = z; t.r = clampR(r); t.live = true;
+    if (fast) {
+      const o = j * 16;
+      for (let k = 0; k < 16; k++) t.m[k] = pose16[o + k];
+    } else {
+      const mm = jp.transform.matrix;                       // XRRigidTransform.matrix — те же 16
+      if (mm) for (let k = 0; k < 16; k++) t.m[k] = mm[k]; else t.m.set(IDENT16);
+    }
     n++;
   }
   return n;
@@ -512,15 +758,7 @@ function tick(time, frame) {
     const steps = Math.max(1, Math.min(4, Math.round(dt / DT)));
     const s0 = performance.now();
     for (let s = 0; s < steps; s++) {
-      maxOver = stepPhysics(1, (buf) => {
-        for (let i = 0; i < MAX_SLOTS; i++) {
-          const g = targets[i];
-          buf[i * 4] = g.live ? g.x : NaN;
-          buf[i * 4 + 1] = g.live ? g.y : 0;
-          buf[i * 4 + 2] = g.live ? g.z : 0;
-          buf[i * 4 + 3] = g.r;
-        }
-      });
+      maxOver = stepPhysics(1, fromTargets);
     }
     stepMs = stepMs * 0.8 + (performance.now() - s0) * 0.2;
   }
@@ -545,6 +783,8 @@ function updateStat() {
     frameMs.toFixed(1) + ' мс · рук ' + handsSeen + ' (' + jointsLive + ' суставов) · контроллеров ' +
     padSeen + ' · контактов ' + frameContacts.length + ' · v ' + maxSpeed.toFixed(2) + ' м/с' +
     (maxOver > 0.001 ? ' · leash вжата +' + maxOver.toFixed(3) + ' м' : '') +
+    (grabs.size ? ' · держит ' + [...grabs.values()]
+      .map((g) => g.id + ' ' + g.slots.length + ' п.').join(', ') : '') +
     ' · отправлено ' + sent;
 }
 
@@ -561,10 +801,12 @@ function jointStats() {
 
 function perfLine() {
   const j = jointStats();
+  // G — что сейчас в захвате: s2 = шар держат 2 сустава. Строка луча короткая, поэтому id одна буква.
+  const G = 'G' + (grabs.size ? [...grabs.values()].map((g) => g.id[0] + g.slots.length).join(',') : '0');
   return ['f' + fps.toFixed(0), 'step' + stepMs.toFixed(1), 'fr' + frameMs.toFixed(1),
     'c' + frameContacts.length, 'v' + maxSpeed.toFixed(2), 'pen' + pen.toFixed(3),
     'lv' + maxOver.toFixed(3), 'j' + j.n + '(' + (j.lo * 1000).toFixed(0) + '-' +
-    (j.hi * 1000).toFixed(0) + 'мм)', srcNote.replace(/[ ,]/g, '')].join('|');
+    (j.hi * 1000).toFixed(0) + 'мм)', G, srcNote.replace(/[ ,]/g, '')].join('|');
 }
 
 function fullReport() {
@@ -572,7 +814,9 @@ function fullReport() {
   return JSON.stringify({
     mode: mode, fps: +fps.toFixed(1), stepMs: +stepMs.toFixed(2), frameMs: +frameMs.toFixed(2),
     contacts: frameContacts.length, v: +maxSpeed.toFixed(3), pen: +pen.toFixed(4),
-    leashOver: +maxOver.toFixed(4), src: srcNote, handsMode: handsMode,
+    leashOver: +maxOver.toFixed(4), src: srcNote, handsMode: handsMode, grabOn: grabOn,
+    grabs: [...grabs.values()].map((g) => ({ id: g.id, side: g.side, slots: g.slots.slice(),
+      span: +gripSpan(g.slots).span.toFixed(4), spanMin: +g.spanMin.toFixed(4) })),
     joints: j.n, jointRmin: +j.lo.toFixed(4), jointRmax: +j.hi.toFixed(4),
     bodies: bodyIds.map((id, i) => { const p = posOf(bodiesList[i]); return [id, +p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)]; }),
     anchors: bodyIds.map((id) => { const a = anchors.get(id); return [id, +a.x.toFixed(3), +a.y.toFixed(3), +a.z.toFixed(3)]; }),
@@ -639,6 +883,11 @@ el('preview').addEventListener('click', () => {
 });
 el('btnReset').addEventListener('click', () => placeInFrontOfHead(lastFrame, lastRef));
 el('btnHands').addEventListener('click', () => { showHands = !showHands; });
+el('btnGrab').addEventListener('click', () => {
+  grabOn = !grabOn;
+  if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'btn');
+  el('btnGrab').textContent = grabOn ? 'Захват вкл' : 'Захват выкл';
+});
 el('btnReport').addEventListener('click', () => beacon('FULL|' + fullReport()));
 
 window.addEventListener('resize', () => {
@@ -678,7 +927,8 @@ window.__ja = {
     const fin = fingers.map((f, i) => { const p = posOf(f); return { i, x: p.x, y: p.y, z: p.z, r: slotR[i] }; });
     return { mode, bodies: list, fingers: fin, contacts: frameContacts.length, pen: penMax,
       hands: handsSeen, pads: padSeen, joints: jointsLive, slots: MAX_SLOTS,
-      handsMode: handsMode, numBodies: ps.GetNumBodies(), radii: slotR.slice(),
+      handsMode: handsMode, grabOn: grabOn, grabs: window.__ja.grab(),
+      numBodies: ps.GetNumBodies(), radii: slotR.slice(),
       leash: leashMeters };
   },
   step(n, fill) { for (let k = 0; k < n; k++) maxOver = stepPhysics(1, fill); syncThree(); },
@@ -701,8 +951,63 @@ window.__ja = {
     if (o.leash !== undefined) leashMeters = o.leash;
     if (o.hands !== undefined) handsMode = o.hands === 'index' ? 'index' : 'full';
     if (o.proxy !== undefined) showHands = !!o.proxy;
+    if (o.grab !== undefined) {
+      grabOn = !!o.grab;
+      if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'cfg');
+    }
   },
   freeze(v) { frozen = !!v; },
+  /* Захват изнутри страницы: состояние, перевод тела и ручной ввод суставов (для тестов без
+   * шлема: тот же путь, что и живой цикл — цели в targets, шаг через fromTargets). */
+  grab() { return grabState(); },
+  // Диагностика детекции: что дал предыдущий шаг в пересчёте на слоты/фигуры и какие
+  // пары считаются «держат с двух сторон». Нужна, потому что контакты приходят указателями.
+  gripDbg() {
+    return frameContacts.map((c) => ({
+      slot: keyToSlot.has(c.a) ? keyToSlot.get(c.a) : keyToSlot.get(c.b),
+      fig: keyToSlot.has(c.a) ? keyToFig.get(c.b) : keyToFig.get(c.a),
+      pen: +c.pen.toFixed(4),
+      p: [+c.x.toFixed(4), +c.y.toFixed(4), +c.z.toFixed(4)],
+      dir: (() => {
+        const s = keyToSlot.has(c.a) ? keyToSlot.get(c.a) : keyToSlot.get(c.b);
+        if (s === undefined) return null;
+        const j = posOf(fingers[s]);
+        const dx = c.x - j.x, dy = c.y - j.y, dz = c.z - j.z, d = Math.hypot(dx, dy, dz) || 1;
+        return [+(dx / d).toFixed(3), +(dy / d).toFixed(3), +(dz / d).toFixed(3)];
+      })(),
+    }));
+  },
+  cand() { return gripCandidates(); },
+  grabbedIds() { return [...grabbed]; },
+  motion(id) {
+    const t = bi.GetMotionType(bodies.get(id));
+    return t === Jolt.EMotionType_Kinematic ? 'кинематик' : t === Jolt.EMotionType_Dynamic ? 'динамик' : 'стик';
+  },
+  // Угол вокруг Z: тела в тестах крутятся только вокруг этой оси, и её компонента quaternion'a
+  // и есть искомый поворот (в пределах ±π).
+  rotAngle(id) {
+    const q = bi.GetRotation(bodies.get(id));
+    return 2 * Math.atan2(q.GetZ(), q.GetW());
+  },
+  setJoint(slot, x, y, z, r, spin) {
+    const t = targets[slot];
+    t.x = x; t.y = y; t.z = z; t.r = clampR(r); t.live = true;
+    const a = spin || 0;
+    t.m.set([Math.cos(a), Math.sin(a), 0, 0, -Math.sin(a), Math.cos(a), 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  },
+  stepTargets(n) { for (let k = 0; k < n; k++) maxOver = stepPhysics(1, fromTargets); syncThree(); },
+  // Увести все суставы кистей из кадра (тесты: после прогонов «ладонью» их тела остаются
+  // лежать вокруг фигуры и портят следующие проверки). Везёт их тот же drive, поэтому
+  // расстояние больше 25 см уходит в телепорт, а не в полёт со 200 м/с.
+  parkFingers() {
+    for (let s = 0; s < 2 * HAND_SLOTS; s++) {
+      const t = targets[s];
+      t.live = true;
+      t.x = (s < HAND_SLOTS ? -1 : 1) * 3; t.y = 2.5 + (s % 5) * 0.02; t.z = (s % 25) * 0.02;
+      t.m.set(IDENT16);
+    }
+    for (let s = 2 * HAND_SLOTS; s < MAX_SLOTS; s++) targets[s].live = false;
+  },
   pointer: () => ({ has: ptr.has, ndc: [ptr.x, ptr.y], used: [ptr.usedX, ptr.usedY],
     applied: ptr.applied, target: Object.assign({}, targets[PTR_SLOT]), slot: PTR_SLOT,
     hit: [+hit.x.toFixed(4), +hit.y.toFixed(4), +hit.z.toFixed(4)],

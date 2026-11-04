@@ -134,23 +134,26 @@ const driver = `
     ok('слотов ввода хватает на две кисти', NSLOT === 52,
       'слотов ' + NSLOT + ', тел в мире ' + H.info().numBodies);
 
-    // G. «ладонь» — стена из 25 суставов — толкает шарик всей площадью
+    // G. «ладонь» — стена из 25 суставов — толкает шарик всей площадью. Захват при этом
+    // обязан НЕ включаться: ладонь толкает с одной стороны, держать нечем.
     function palm(buf, X) {
       for (var j = 0; j < 25; j++) {
         fin(buf, j, X, -0.06 + Math.floor(j / 5) * 0.03, -0.06 + (j % 5) * 0.03);
       }
       for (var j2 = 25; j2 < NSLOT; j2++) off(buf, j2);
     }
-    var px = 0.22, touched = 0, x0 = H.body('sphere').x;
+    var px = 0.22, touched = 0, x0 = H.body('sphere').x, palmGrabs = 0;
     for (var g = 0; g < 160; g++) {
       px -= 0.002;
       var ig = one(function (buf) { palm(buf, px); });
       if (ig.contacts > 0) touched++;
+      palmGrabs = Math.max(palmGrabs, H.grab().length);
     }
     var sx = H.body('sphere').x;
-    ok('ладонь из 25 суставов толкает шарик', touched > 0 && sx < x0 - 0.05,
+    ok('ладонь из 25 суставов толкает шарик, но не хватает', touched > 0 && sx < x0 - 0.05 &&
+      palmGrabs === 0,
       'кадров с контактом ' + touched + ' из 160, шарик с ' + x0.toFixed(3) + ' до ' +
-      sx.toFixed(3) + ' м');
+      sx.toFixed(3) + ' м, захватов максимум ' + palmGrabs);
 
     // H. две кисти внахлёст: пара рука↔рука выключена в фильтре пар, иначе 50 суставов
     // начали бы генерировать манifold'ы на каждом кадре
@@ -213,6 +216,97 @@ const driver = `
       'кадров с контактом ' + touchAll + ' из 72, скорость шарика максимум ' + maxV.toFixed(3) +
       ' м/с, поводок выдержан до ' + worstLeash.toFixed(3) + ' м при лимите ' + LEASH +
       ', ошибок ' + H.diag().errs.length);
+
+    // L..L6. захват: предмет с двух сторон держат разные пальцы одной кисти
+    H.cfg({ leash: 0.9 });
+    // Пальцы слева и справа от шарика по x, общий центр. pin(xoff) сжимает, spin поворачивает.
+    function pin(xoff, cz, spin) {
+      H.setJoint(9, xoff, 0, cz, 0.013, spin);       // index-tip левой
+      H.setJoint(14, -xoff, 0, cz, 0.013, spin);     // middle-tip левой
+      H.stepTargets(1);
+    }
+    // Каждое измерение начинается с чистого кадра: снятый захват, убранные из кадра суставы
+    // (после проверки J пятьдесят их тел лежат вокруг фигур), фигуры на своих местах.
+    function cleanRow() {
+      H.cfg({ grab: false });
+      H.parkFingers(); H.stepTargets(2);
+      H.cfg({ grab: true });
+      H.park('sphere', 0, 0, 0);
+      H.park('torus', 0, 3, 0);
+      H.park('cube', 0, -3, 0);
+    }
+    function squeezeIn(cz) {
+      var x = 0.12;
+      for (var s = 0; s < 90; s++) { x -= 0.0015; pin(x, cz, 0); if (H.grab().length) return x; }
+      return null;
+    }
+
+    cleanRow();
+    var gx = squeezeIn(0);
+    var g = H.grab()[0];
+    ok('два пальца с двух сторон берут шарик в захват', gx !== null && g &&
+      g.id === 'sphere' && g.slots.length >= 2 && H.motion('sphere') === 'кинематик',
+      gx === null ? 'захват не включился; контакты: ' +
+        JSON.stringify(H.gripDbg()).slice(0, 420) + ' кандидаты: ' +
+        JSON.stringify(H.cand()).slice(0, 200) : 'слоты ' + JSON.stringify(g.slots) +
+      ', взято при |x|=' + gx.toFixed(4) + ' (контакт начинается на ' +
+      (0.035 + 0.013 + PAD).toFixed(3) + '), тело: ' + H.motion('sphere'));
+
+    // L2. один палец захват не включает (тот же шарик, та же глубина)
+    cleanRow();
+    var oneTouch = 0;
+    for (var l2 = 0; l2 < 60; l2++) {
+      H.setJoint(9, 0.075 - l2 * 0.0005, 0, 0, 0.013, 0);
+      H.stepTargets(1);
+      if (H.info().contacts > 0) oneTouch++;
+    }
+    ok('одного пальца мало: захвата нет', H.grab().length === 0 && oneTouch > 10,
+      'контактов ' + oneTouch + ' кадров из 60, захватов ' + H.grab().length);
+
+    // L3. захват тащит шарик за собой и держит, пока пальцы сжимаются
+    cleanRow();
+    gx = squeezeIn(0);
+    var zc = 0, z0 = H.body('sphere').z;
+    for (var l3 = 0; l3 < 120; l3++) { zc -= 0.0025; pin(gx, zc, 0); }
+    var afterCarry = H.body('sphere');
+    for (var l3b = 0; l3b < 20; l3b++) pin(gx - 0.0005, zc, 0);   // ещё и дожимаем
+    var stillHeld = H.grab().length === 1;
+    ok('захват ведёт шарик за центром пальцев и не рвётся при сжатии',
+      gx !== null && stillHeld && Math.abs(afterCarry.z - zc) < 0.02 &&
+      Math.abs(afterCarry.x) < 0.02,
+      'центр захвата z=' + zc.toFixed(3) + ', шарик z=' + afterCarry.z.toFixed(3) +
+      ' x=' + afterCarry.x.toFixed(3) + ' (было z=' + z0.toFixed(3) + '), удерживается после' +
+      ' дожима: ' + stillHeld + ', размах ' + (g && H.grab()[0] ? H.grab()[0].span : '-') +
+      ' при минимуме ' + (H.grab()[0] ? H.grab()[0].spanMin : '-'));
+
+    // L4. поворот: фигура крутится вместе с пальцами
+    var qz0 = H.rotAngle('sphere');
+    for (var l4 = 0; l4 <= 60; l4++) pin(gx, zc, l4 * (1.0 / 60));
+    var turned = H.rotAngle('sphere') - qz0;
+    ok('поворот пальцев поворачивает удерживаемый шарик', Math.abs(turned - 1.0) < 0.25,
+      'пальцы провернули 1.000 рад, шарик — ' + turned.toFixed(3) + ' рад');
+
+    // L5. в идущий захват новые суставы не добавляются
+    var slotsBefore = H.grab()[0] ? H.grab()[0].slots.length : 0;
+    for (var l5 = 0; l5 < 30; l5++) {
+      H.setJoint(19, 0, 0, zc + 0.045, 0.013, 0);    // ещё один палец лезет на шарик
+      pin(gx, zc, 1.0);
+    }
+    var slotsAfter = H.grab()[0] ? H.grab()[0].slots.length : 0;
+    ok('в идущий захват новые суставы не добавляются',
+      H.grab().length === 1 && slotsAfter === slotsBefore && slotsBefore >= 2,
+      'было ' + slotsBefore + ' слота, стало ' + slotsAfter);
+    H.setJoint(19, 3, 0, 0, 0.013, 0);
+
+    // L6. пальцы разошлись — отпускание, и тело снова динамическое
+    var relZ = H.body('sphere').z, spread = gx;
+    for (var l6 = 0; l6 < 40; l6++) { spread += 0.0015; pin(spread, zc, 1.0); }
+    ok('разжатые пальцы отпускают шарик', H.grab().length === 0 &&
+      H.motion('sphere') === 'динамик',
+      'размах вырос с ' + gx.toFixed(3) + ' до ' + spread.toFixed(3) + ' м (порог 0.030), ' +
+      'захватов ' + H.grab().length + ', тело: ' + H.motion('sphere') +
+      ', шарик: z=' + H.body('sphere').z.toFixed(3) + ' (было ' + relZ.toFixed(3) + ')');
+    H.parkFingers(); H.stepTargets(3);
 
     // E. place() — «перед собой»: якоря и тела совпадают
     H.place();
