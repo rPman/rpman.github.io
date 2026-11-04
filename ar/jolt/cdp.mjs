@@ -27,6 +27,9 @@ const shot = shotAt >= 0 ? argv[shotAt + 1] : null;
 // Свою вкладку по умолчанию закрываем (иначе от прогонов их становится десятки), --keep
 // оставляет открытой: рядом монитор, на кадр можно посмотреть живьём.
 const keep = argv.includes('--keep');
+// --pointer: гоняет превью живыми мышью-событиями (Input.dispatchMouseEvent). Headless так не
+// умеет: rAF там ~3 к/с, а курсор пишется именно в боевом цикле.
+const pointerSweep = argv.includes('--pointer');
 const CDP = process.env.CDP || 'http://127.0.0.1:9222';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -165,6 +168,48 @@ if (ready === 'ready') {
       бюджет_кадра_мс: +(1000 / 72).toFixed(2), in_loop_perf: H.perf() };
   })()`);
   console.log('шаг: ' + JSON.stringify(cost));
+}
+
+if (pointerSweep) {
+  /* Превью живым циклом: синтетические pointermove (обработчик читает clientX/clientY, поэтому
+   * синтетика годится) вдоль горизонтальной линии, каждый шаг — свой кадр rAF. Курсор пишет
+   * кончик указательного левой кисти (слот 9), так что заодно проверяется карта слотов. */
+  const sweep = await evalJs(`(async () => {
+    const H = window.__ja, cv = document.querySelector('canvas');
+    document.getElementById('preview').click();
+    // Ряд как на старте: предыдущие пробы (цена шага) разводят фигуры, а свип считается по
+    // горизонтальной линии через центр кольца.
+    H.park('sphere', -0.28, 0, 0); H.park('torus', 0, 0, 0); H.park('cube', 0.30, 0, 0);
+    await new Promise((r) => requestAnimationFrame(r));
+    const b0 = H.body('sphere'), t0 = H.body('torus');
+    const move = (fx, fy) => cv.dispatchEvent(new PointerEvent('pointermove',
+      { clientX: innerWidth * fx, clientY: innerHeight * fy, bubbles: true }));
+    /* Горизонтальная строка на середине экрана проходит на 53 мм НИЖЕ центра ряда (камеру
+     * наклоняет долли), то есть шарика едва касается и не толкает. Строку ищем сами:
+     * fy, у которой точка попадания ближе всего к y ряда. */
+    let fy = 0.5, bestDy = 1e9;
+    for (let i = 0; i <= 24; i++) {
+      move(0.5, 0.42 + 0.2 * i / 24);
+      await new Promise((r) => requestAnimationFrame(r));
+      const dy = Math.abs(H.pointer().hit[1] - b0.y);
+      if (dy < bestDy) { bestDy = dy; fy = 0.42 + 0.2 * i / 24; }
+    }
+    let maxC = 0, touched = 0;
+    for (let i = 0; i <= 90; i++) {
+      move(0.15 + 0.7 * i / 90, fy);
+      await new Promise((r) => requestAnimationFrame(r));
+      const c = H.info().contacts;
+      if (c > maxC) maxC = c;
+      if (c > 0) touched++;
+    }
+    const p = H.pointer();
+    return { mode: H.info().mode, slot: p.slot, applied: p.applied, fy: +fy.toFixed(3),
+      hit: p.hit, frames: H.diag().frames, maxContacts: maxC, framesWithContact: touched,
+      sphereBefore: [+b0.x.toFixed(3), +b0.z.toFixed(3)],
+      sphereAfter: [+H.body('sphere').x.toFixed(3), +H.body('sphere').z.toFixed(3)],
+      torusMoved: +(H.body('torus').x - t0.x).toFixed(3), errs: H.diag().errs };
+  })()`, true);
+  console.log('превью: ' + JSON.stringify(sweep));
 }
 
 if (expr) console.log('eval: ' + JSON.stringify(await evalJs(expr, true), null, 1));
