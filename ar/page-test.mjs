@@ -133,6 +133,35 @@ const driver = `
        Math.abs(h2.pos.x - beforeJit) < 5e-4 && h2.speed < 0.02,
        'Δ=' + Math.abs(h2.pos.x - beforeJit).toExponential(1) + ' v=' + h2.speed.toFixed(4));
     ok('всё конечно', isFinite(h2.pos.x) && isFinite(h2.pos.y) && isFinite(h2.speed), JSON.stringify(h2.pos));
+
+    // G. фигуры толкают друг друга: рука ведёт сферу, сфера — куб, куб — тетраэдр
+    SP.place(hs.world, 0, 0, 0);
+    var cube = hs.body('cube'), tetra = hs.body('tetra');
+    SP.place(cube, 0.26, 0, 0);
+    SP.place(tetra, 0.52, 0, 0);
+    var pusher = { x: -0.22, y: 0, z: 0, vx: 0.35, vy: 0, vz: 0, r: 0.010 };
+    hs.step(170, mover(pusher));
+    var g = hs.info();
+    var gc = pick(g.bodies, 'cube'), gt = pick(g.bodies, 'tetra');
+    var touchSC = hs.world.radius + cube.radius + hs.world.bodyPad;
+    var touchCT = cube.radius + tetra.radius + hs.world.bodyPad;
+    ok('цепочка: куб поехал за сферой', gc.x > 0.26 + 0.25, 'x=' + gc.x.toFixed(3));
+    ok('цепочка: тетраэдр поехал за кубом', gt.x > 0.52 + 0.15, 'x=' + gt.x.toFixed(3));
+    ok('цепочка: сфера не прошла сквозь куб', gc.x - g.pos.x >= touchSC - 0.002,
+       'зазор=' + (gc.x - g.pos.x).toFixed(4) + ' ожидали≥' + touchSC.toFixed(4));
+    ok('цепочка: куб не отстал от сферы', gc.x - g.pos.x < touchSC + 0.02,
+       'зазор=' + (gc.x - g.pos.x).toFixed(4));
+    ok('цепочка: тетраэдр не вжат в куб', gt.x - gc.x >= touchCT - 0.002,
+       'зазор=' + (gt.x - gc.x).toFixed(4) + ' ожидали≥' + touchCT.toFixed(4));
+    ok('цепочка: ни одна пара фигур не пересекается', g.bodyPen < 1e-4, 'pen=' + g.bodyPen.toExponential(1));
+    ok('цепочка: касания видны на всех трёх', g.contacts > 0 && gc.contacts > 0 && gt.contacts > 0,
+       'сфера=' + g.contacts + ' куб=' + gc.contacts + ' тетраэдр=' + gt.contacts);
+    pusher.vx = 0;                                   // рука встала — моментума нет ни у кого
+    hs.step(30, mover(pusher));
+    var g2 = hs.info(), gc2 = pick(g2.bodies, 'cube'), gt2 = pick(g2.bodies, 'tetra');
+    ok('цепочка: рука встала — все фигуры встали',
+       g2.speed < 0.02 && gc2.speed < 0.02 && gt2.speed < 0.02,
+       'сфера=' + g2.speed.toFixed(4) + ' куб=' + gc2.speed.toFixed(4) + ' тетр=' + gt2.speed.toFixed(4));
   } catch (err) {
     exc = String(err && err.stack || err);
   }
@@ -147,6 +176,14 @@ writeFileSync(join(TMP, 'test.html'), htmlAbs.replace('</body>', driver + '\n</b
 function shotDriver(jitter) {
   return `
 <script>
+  // Исключение внутри боевого rAF-цикла не ломает DOM: кадр просто остаётся чёрным.
+  // Поэтому его ловим и вывешиваем в DOM — ниже это проверяется отдельным проходом.
+  window.addEventListener('error', function (e) {
+    var d = document.createElement('pre');
+    d.id = 'shotError';
+    d.textContent = e.message + ' @ ' + e.filename + ':' + e.lineno;
+    document.body.appendChild(d);
+  });
   var b = document.getElementById('preview');
   if (b) b.click();
   window.addEventListener('load', function () {
@@ -195,7 +232,6 @@ for (const c of rep.checks) {
   if (!c.ok) fails++;
 }
 if (rep.exc) { console.log('FAIL исключение: ' + rep.exc); fails++; }
-console.log(fails ? '\n' + fails + ' FAIL' : '\nстраница: всё ok');
 
 for (const [pg, png] of [[page, 'shot_start.png'], [join(TMP, 'shot.html'), 'shot_preview.png'],
                          [join(TMP, 'shot_contact.html'), 'shot_contact.png']]) {
@@ -207,4 +243,18 @@ for (const [pg, png] of [[page, 'shot_start.png'], [join(TMP, 'shot.html'), 'sho
     console.log('не удалось снять ' + png + ': ' + String(err).slice(0, 200));
   }
 }
+
+/* Боевой rAF-цикл живёт в shot.html: исключение внутри него не ломает DOM, а скриншот
+ * просто выходит чёрным (отчёт через __hs его не ловает). Проверяем цикл отдельным
+ * проходом: драйвер вешает <pre id="shotError"> на window.onerror. */
+try {
+  const shotDom = chrome(['--virtual-time-budget=12000', '--dump-dom', 'file://' + join(TMP, 'shot.html')]);
+  const shotErr = shotDom.match(/<pre id="shotError"[^>]*>([\s\S]*?)<\/pre>/);
+  if (shotErr) { console.log('FAIL кадр превью бросает исключение: ' + shotErr[1]); fails++; }
+  else console.log('боевой кадр: в rAF-цикле исключений нет');
+} catch (err) {
+  console.log('FAIL не удалось проверить боевой кадр: ' + String(err).slice(0, 200));
+  fails++;
+}
+console.log(fails ? '\n' + fails + ' FAIL' : '\nстраница: всё ok');
 process.exit(fails ? 1 : 0);

@@ -188,8 +188,10 @@
   function readFakeHand() {
     jointBuf.fill(NaN);                     // фан-кисть короче реальной: хвост обязан быть пуст
     if (!pointer.has) return 0;
+    // плоскость строим по позиции mesh (THREE.Vector3): у тела pos — простой объект, THREE
+    // требует именно вектор (у него есть .dot)
     plane.setFromNormalAndCoplanarPoint(viewDir.set(0, 0, -1).applyQuaternion(camera.quaternion),
-                                        lead.body.pos);
+                                        lead.mesh.position);
     ndc.set(pointer.x, pointer.y);
     ray.setFromCamera(ndc, camera);
     if (!ray.ray.intersectPlane(plane, hitPt)) return 1;
