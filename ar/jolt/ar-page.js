@@ -332,10 +332,13 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  * группы — сторона+группа, значит ладонь левой и ладонь правой РАЗНЫЕ группы: держать двумя
  * руками можно, в том числе двумя ладонями.
  *
- * Как держим: фигура на время захвата становится КИНЕМАТИЧЕСКОЙ и едет за кадром захвата.
- * Проверено в node (ar/jolt/spike.mjs): кинематик интегрирует и линейную, и угловую скорость и
- * возвращается в динамику. Следствие: контактов палец<->фигура во время захвата нет вовсе
- * (kinematic<->kinematic), поэтому отпускание и приход второй руки судятся ГЕОМЕТРИЕЙ.
+ * Как держим: фигура В ОСТАЁТСЯ ДИНАМИКОЙ, а захват ведёт её скоростью к кадру захвата (так же,
+ * как ведутся пальцы). Раньше на время захвата она становилась кинематиком, и это было видно
+ * глазами: kinematic<->kinematic контактов не бывает вовсе (замер в spike.mjs), поэтому держимый
+ * предмет — призрак и для другой руки, и для другого держимого предмета: два предмета в двух
+ * руках проходили сквозь друг друга (замечание владельца на живом заходе 2026-11-05; решение —
+ * держать динамиком). Цена: предмет отстаёт от кисти на долю шага (GRAB_FOLLOW) и его можно
+ * вытолкнуть из захвата, если толкать сильнее, чем ведёт захват.
  *
  * КАДР ЗАХВАТА — жёсткая подгонка (Kabsch/Procrustes) по всем шарам захвата обеих рук: центр —
  * средневзвешенный по радиусам центр всех державших шаров, поворот — тот, что лучше всего
@@ -343,19 +346,46 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  * ≥3 неколлинеарных шаров; иначе предмет только переезжает, но не крутится — раньше ориентацию
  * брали с матрицы одного сустава ровно потому, что двух пальцев для поворота не хватает.
  *
- * ОТПУСКАЕТ КОНЕЧНОСТЬ, а не весь захват: у каждой руки свой счётчик разжима (GRAB_OPEN от
- * самого сжатого кадра) и свой счётчик потерянных кадров (GRAB_LOST). Вышедшая конечность
- * перестаёт сталкиваться с фигурой ещё на GRAB_GRACE секунд — или пока её шары не выйдут из
- * фигуры: иначе застрявшие внутри шары продолжают тащить предмет, и захват кажется
- * бесконечным.
+ * ОТПУСКАЕТ КОНЕЧНОСТЬ, а не весь захват: у каждой руки свои счётчики разжима и потери.
+ * Вышедшая конечность перестаёт сталкиваться с фигурой ещё на GRAB_GRACE секунд — или пока её
+ * шары не выйдут из фигуры: иначе застрявшие внутри шары продолжают тащить предмет, и захват
+ * кажется бесконечным. То же окно запрещает и сразу ВЗЯТЬ предмет обратно (см. graced): на
+ * живом заходе release и grab шли в одну секунду, и предмет выглядел приваренным к кисти.
  * Конечностей не осталось — захват окончен.
+ *
+ * ПО ЧЕМУ СУДЯТ О РАЗЖАТИИ (переписано после живого захода на PICO 2026-11-05). Прежняя мера —
+ * размах шаров захвата как ДИАГОНАЛЬ ОСЕВОГО ЯЩИКА — на живой руке ломалась в обе стороны:
+ * ящик поворачивается вместе с кистью, поэтому 8-9-сферные захваты «разжимались» сами собой
+ * (отпускание в ту же секунду, что и взятие), а щепотка из двух кончиков, наоборот, не
+ * отпускала 10-14 с — предмет висел до тех пор, пока кисть вообще не терялась (leave|lost).
+ * Теперь две независимые меры, обе только по самой кисти:
+ *   APERTURE — наибшая попарная дистанция живых шаров захвата ЭТОЙ руки. Инвариантна к
+ *     повороту и переносу кисти (в отличие от ящика); растёт, когда пальцы расходятся.
+ *   CURL — среднее |кончик пальца − его плюсневая кость| по пальцам, чьи суставы видены и
+ *     стоят правдоподобно близко. Это сгиб самих пальцев: кулак ≈ 60-80 мм, раскрытая кисть
+ *     ≈ 160-190 мм. Работает и когда в захвате один шар (у щепотки размах оценить нечем).
+ * Ни одна из них не измеряет расстояние до предмета: предмет едет за кистью, поэтому по нему
+ * раскрывание ладони невидимо вовсе.
  */
 const GRAB_MIN_JOINTS = 2;       // минимум разных суставов, чтобы держать
 const GRAB_FRAMES = 3;           // сколько кадров подряд условие держится до включения
 const GRAB_OPPOSE = -0.3;        // dot направлений толкания пары: ниже — значит держат с двух сторон
-const GRAB_OPEN = 0.03;          // м: насколько разжались пальцы относительно минимума — отпустить
-const GRAB_LOST = 30;            // кадров без двух живых суставов — отпустить
-const GRAB_MAX_SPAN = 0.20;      // м: размах больше этого — это не захват, а случайные касания
+/* Насколько кисть раскрылась относительно самого сжатого кадра — отпустить. Правится на ходу,
+ * чтобы калибровать по живым числам без переката: ?open=60 (в миллиметрах). */
+let GRAB_OPEN = isFinite(+QS.get('open')) && +QS.get('open') > 0 ? +QS.get('open') / 1000 : 0.045;
+/* Потеря кисти: счёт копится шагом (+1 за кадр без кисти, −1 за живой), поэтому мигание
+ * трекинга на PICO — 3 кадра через 1 — предмет не отпускает, а настоящая потеря за 0.5 с
+ * отпускает. Прежний «подряд, сброс в ноль» переживался одним хорошим кадром и держал предмет
+ * по 10-14 с. */
+const GRAB_LOST = 36;
+/* Доля рассогласования, которую захват выбирает за шаг. 1 = мёртвая петля: предмет встает в
+ * кадр ровно за шаг, и толкнуть его другой рукой глазами невозможно (возврат тот же шаг).
+ * 0.6: отставание ~1.7 шага (на скорости руки 0.4 м/с это ~1 см), зато держимый предмет реально
+ * поддаётся толчку и его можно вытолкнуть из захвата. Правится на ходу: ?follow=0.4 */
+let GRAB_FOLLOW = isFinite(+QS.get('follow')) && +QS.get('follow') > 0 ?
+  Math.min(1, +QS.get('follow')) : 0.6;
+const GRAB_TELEPORT = 0.25;      // м: крупный разрыв уходит в телепорт, как у пальцев
+const GRAB_JOINT_REACH = 0.25;   // м: дальше этого сустав не «палец этой кисти» (в тестах кисти убраны)
 const GRAB_GRACE = 1.0;          // с: ещё столько снятая конечность не трогает выпущенную фигуру
 const FIT_RANK = 0.1;            // σ3/σ2 ниже — конфигурация вырождена, поворот не берём
 let grabOn = QS.get('grab') !== '0';
@@ -429,6 +459,8 @@ function gripCandidates() {
     if (!slots) continue;
     const sides = [...new Set(slots.map((s) => handOfSlot(s)))];
     if (sides.some((sd) => sideBusy(sd) !== null)) continue;   // рука уже что-то держит
+    // и та же рука сразу после отпускания не берёт тот же предмет обратно
+    if (sides.some((sd) => regrabBlocked(fig, sd))) continue;
     out.push({ fig, sides, slots });
   }
   return out;
@@ -442,6 +474,7 @@ function joinCandidates() {
   for (const g of grabs.values()) {
     for (let side = 0; side < 2; side++) {
       if (g.groups.has(side) || sideBusy(side) !== null) continue;
+      if (regrabBlocked(g.id, side)) continue;      // та же рука сразу после отпускания
       const entries = [];
       for (let j = 0; j < HAND_SLOTS; j++) {
         const s = side * HAND_SLOTS + j, t = targets[s];
@@ -478,17 +511,51 @@ function gripSlotsOf(entries) {
   return slots.length >= GRAB_MIN_JOINTS ? slots : null;
 }
 
-function gripSpan(slots) {
-  const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
-  let live = 0;
+/* Размах захвата руки: НАИБОЛЬШАЯ попарная дистанция её живых шаров. Диагональ осевого ящика
+ * для этого не годится — ящик поворачивается вместе с кистью, и поворот кисти в пространстве
+ * менял «размах» на десятки миллиметров (на живом заходе именно так захваты и отпускались сами
+ * собой). Здесь поворот и перенос кисти не влияют вовсе: считается только конфигурация шаров. */
+function aperture(slots) {
+  let ap = 0, live = 0;
+  const v = [];
   for (const s of slots) {
     const t = targets[s];
     if (!t.live) continue;
     live++;
-    const v = [t.x, t.y, t.z];
-    for (let k = 0; k < 3; k++) { if (v[k] < lo[k]) lo[k] = v[k]; if (v[k] > hi[k]) hi[k] = v[k]; }
+    v.push(t);
   }
-  return { span: live ? Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) : 0, live };
+  for (let i = 0; i < v.length; i++) {
+    for (let j = i + 1; j < v.length; j++) {
+      const d = Math.hypot(v[i].x - v[j].x, v[i].y - v[j].y, v[i].z - v[j].z);
+      if (d > ap) ap = d;
+    }
+  }
+  return { ap: live > 1 ? ap : 0, live };
+}
+
+/* Сгиб самой кисти: среднее |кончик пальца − его плюсневая кость|. Меряется по всем пальцам
+ * кисти, а не по державшим шарам, поэтому работает и когда захват держит один шар (у щепотки
+ * размах оценить нечем). Пальцы с убранной парой суставов (трекинг потерял кончик, либо кисть
+ * вообще уведена из кадра) в среднее не входят: GRAB_JOINT_REACH отсекает абсурдные расстояния,
+ * иначе убранная в тесте кисть дала бы «раскрытие» в 2.5 м. */
+const FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+const META_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(f + '-metacarpal'));
+const TIP_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(f + '-tip'));
+function handCurl(side) {
+  let sum = 0, n = 0;
+  for (let f = 0; f < FINGER_NAMES.length; f++) {
+    const a = targets[side * HAND_SLOTS + META_SLOT[f]], b = targets[side * HAND_SLOTS + TIP_SLOT[f]];
+    if (!a.live || !b.live) continue;
+    const d = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+    if (d > GRAB_JOINT_REACH) continue;
+    sum += d; n++;
+  }
+  return { curl: n ? sum / n : 0, n };
+}
+function handLive(side) {
+  let n = 0;
+  for (let j = 0; j < HAND_SLOTS; j++) if (targets[side * HAND_SLOTS + j].live) n++;
+  return n;
 }
 
 /* ----------------------------------------------- геометрия формы фигуры
@@ -668,7 +735,9 @@ function fitGrip(g, cur) {
 }
 
 function addGroup(g, side, slots) {
-  g.groups.set(side, { slots: slots.slice(), spanMin: gripSpan(slots).span, lost: 0 });
+  const ap = aperture(slots), cu = handCurl(side);
+  g.groups.set(side, { slots: slots.slice(), apMin: ap.ap, curlMin: cu.n >= 2 ? cu.curl : null,
+    lost: 0 });
 }
 
 /* Конечность перестаёт трогать фигуру: во время захвата — пока держит, после отпускания ещё
@@ -693,7 +762,6 @@ function grabStart(c) {
   grabbed.add(c.fig);
   // поводок на время захвата считается от точки захвата: иначе рука не донесла бы фигуру
   anchors.set(c.fig, posOf(bodies.get(c.fig)));
-  bi.SetMotionType(bodies.get(c.fig), Jolt.EMotionType_Kinematic, Jolt.EActivate_Activate);
   reanchor(g);
   beacon('grab|' + c.fig + '|' + allSlots(g).length + '|' +
     sidesOf(g).map((s) => (s ? 'R' : 'L')).join(','));
@@ -709,18 +777,19 @@ function grabJoin(c) {
   beacon('join|' + c.fig + '|' + (c.side ? 'R' : 'L') + '|' + c.slots.length);
 }
 
-/* Одна конечность разжалась — предмет продолжают держать остальные. */
-function groupLeave(g, side, why) {
+/* Одна конечность разжалась — предмет продолжают держать остальные. why плюс числа, по которым
+ * это решено: порог калибруется только живыми замерами, угадать его по документации нельзя. */
+function groupLeave(g, side, why, dbg) {
   g.groups.delete(side);
   addGrace(g.id, side);
-  beacon('leave|' + g.id + '|' + (side ? 'R' : 'L') + '|' + why);
+  blockRegab(g.id, side);
+  beacon('leave|' + g.id + '|' + (side ? 'R' : 'L') + '|' + why + (dbg ? '|' + dbg : ''));
   if (!g.groups.size) { grabEnd(g, why); return; }
   reanchor(g);
 }
 
 function grabEnd(g, why) {
   const b = bodies.get(g.id);
-  bi.SetMotionType(b, Jolt.EMotionType_Dynamic, Jolt.EActivate_Activate);
   anchors.set(g.id, posOf(b));                 // полёт после отпускания — от точки отпускания
   if (g.lin) {
     bi.SetLinearVelocity(b, V(g.lin[0], g.lin[1], g.lin[2]));
@@ -739,13 +808,35 @@ function grabStep() {
   for (const [, g] of [...grabs]) {
     for (const [side, grp] of [...g.groups]) {
       if (!g.groups.has(side)) continue;             // разжатая конечность уже убрана
-      const sp = gripSpan(grp.slots);
-      if (sp.live >= GRAB_MIN_JOINTS && sp.span < grp.spanMin) grp.spanMin = sp.span;
-      if (sp.live < GRAB_MIN_JOINTS) {
-        if (++grp.lost > GRAB_LOST) { groupLeave(g, side, 'lost'); continue; }
-      } else grp.lost = 0;
-      if (sp.span > grp.spanMin + GRAB_OPEN || sp.span > GRAB_MAX_SPAN + GRAB_OPEN) {
-        groupLeave(g, side, 'open'); continue;
+      // Кисти нет в поле (или пропали все её державшие шары) — предмет висит на фантомной
+      // руке. Счёт НАКОПЛЕННЫЙ: трекинг на PICO мигает (в живом логе j50 -> j25 -> j50 в
+      // пределах секунды), и прежний сброс в ноль из-за одного хорошего кадра держал предмет
+      // по 10-14 с, пока кисть не терялась совсем.
+      const ap = aperture(grp.slots);
+      const gone = ap.live === 0 || handLive(side) === 0;
+      if (gone) {
+        grp.lost++;
+        if (grp.lost > GRAB_LOST) {
+          groupLeave(g, side, 'lost', 'j' + handLive(side) + '/' + grp.lost);
+          continue;
+        }
+      } else if (grp.lost > 0) grp.lost--;
+      if (ap.live >= GRAB_MIN_JOINTS) {
+        if (grp.apMin <= 0 || ap.ap < grp.apMin) grp.apMin = ap.ap;
+        if (ap.ap > grp.apMin + GRAB_OPEN) {
+          groupLeave(g, side, 'open', 'ap' + (ap.ap * 1000).toFixed(0) + '/' +
+            (grp.apMin * 1000).toFixed(0) + 'мм');
+          continue;
+        }
+      }
+      const cu = handCurl(side);
+      if (cu.n >= 2) {
+        if (grp.curlMin === null || cu.curl < grp.curlMin) grp.curlMin = cu.curl;
+        if (cu.curl > grp.curlMin + GRAB_OPEN) {
+          groupLeave(g, side, 'open', 'cu' + (cu.curl * 1000).toFixed(0) + '/' +
+            (grp.curlMin * 1000).toFixed(0) + 'мм к' + cu.n);
+          continue;
+        }
       }
     }
     if (!grabs.has(g.id) || !g.p0) continue;         // последняя конечность разжалась
@@ -769,14 +860,17 @@ function grabStep() {
     }
     const b = bodies.get(g.id), p = posOf(b), q = bi.GetRotation(b);
     const ddx = tp.x - p.x, ddy = tp.y - p.y, ddz = tp.z - p.z;
-    if (Math.hypot(ddx, ddy, ddz) > 0.25) {      // телепорт, как у пальцев: иначе 200 м/с
+    if (Math.hypot(ddx, ddy, ddz) > GRAB_TELEPORT) {   // телепорт, как у пальцев: иначе 200 м/с
       bi.SetPositionAndRotation(b, V(tp.x, tp.y, tp.z),
         new Jolt.Quat(TQ.x, TQ.y, TQ.z, TQ.w), Jolt.EActivate_Activate);
       bi.SetLinearVelocity(b, V(0, 0, 0)); bi.SetAngularVelocity(b, V(0, 0, 0));
       g.lin = [0, 0, 0]; g.ang = [0, 0, 0];
       continue;
     }
-    let vx = ddx / DT, vy = ddy / DT, vz = ddz / DT;
+    // Держимое тело ДИНАМИЧНО, поэтому скорость — единственное, чем его можно вести: импульсы
+    // контактов (другая рука, другой держимый предмет) в том же шаге её меняют, и рассогласование
+    // на следующем шаге само показывает, что предмет толкнули.
+    let vx = ddx * GRAB_FOLLOW / DT, vy = ddy * GRAB_FOLLOW / DT, vz = ddz * GRAB_FOLLOW / DT;
     const s2 = Math.hypot(vx, vy, vz);
     if (s2 > MAX_SPEED) { const k = MAX_SPEED / s2; vx *= k; vy *= k; vz *= k; }
     bi.SetLinearVelocity(b, V(vx, vy, vz));
@@ -785,7 +879,8 @@ function grabStep() {
     if (dq.w < 0) { dq.x = -dq.x; dq.y = -dq.y; dq.z = -dq.z; dq.w = -dq.w; }
     const ang = 2 * Math.acos(Math.min(1, dq.w));
     const sn = Math.sqrt(Math.max(1e-9, 1 - dq.w * dq.w));
-    let wx = dq.x / sn * ang / DT, wy = dq.y / sn * ang / DT, wz = dq.z / sn * ang / DT;
+    let wx = dq.x / sn * ang * GRAB_FOLLOW / DT, wy = dq.y / sn * ang * GRAB_FOLLOW / DT,
+      wz = dq.z / sn * ang * GRAB_FOLLOW / DT;
     const sw = Math.hypot(wx, wy, wz);
     if (sw > MAX_SPIN) { const k = MAX_SPIN / sw; wx *= k; wy *= k; wz *= k; }
     bi.SetAngularVelocity(b, V(wx, wy, wz));
@@ -817,21 +912,48 @@ function grabDetect() {
 }
 
 /* Состояние захвата для HUD, луча и тестов: одна запись на фигуру, внутри — разбивка по
- * конечностям (s0 — левая, s1 — правая). */
+ * конечностям (s0 — левая, s1 — правая) и обе меры раскрытия, по которым судится отпускание. */
 function grabState() {
   return [...grabs.values()].map((g) => {
     const slots = allSlots(g).slice().sort((a, b) => a - b);
     const out = { id: g.id, sides: sidesOf(g), slots, fit: g.pts0.length >= 3 };
     for (const [side, grp] of g.groups) {
-      const sp = gripSpan(grp.slots);
-      out['s' + side] = { slots: grp.slots.slice(), span: +sp.span.toFixed(4),
-        spanMin: +grp.spanMin.toFixed(4), lost: grp.lost };
+      const ap = aperture(grp.slots), cu = handCurl(side);
+      out['s' + side] = { slots: grp.slots.slice(), ap: +ap.ap.toFixed(4),
+        apMin: +grp.apMin.toFixed(4), curl: +cu.curl.toFixed(4),
+        curlMin: grp.curlMin === null ? null : +grp.curlMin.toFixed(4), lost: grp.lost };
     }
-    const sp = gripSpan(slots);
-    out.span = +sp.span.toFixed(4);
-    out.spanMin = Math.min(...[...g.groups.values()].map((gr) => +gr.spanMin.toFixed(4)));
+    const ap = aperture(slots);
+    out.ap = +ap.ap.toFixed(4);
+    out.apMin = Math.min(...[...g.groups.values()].map((gr) => +gr.apMin.toFixed(4)));
     return out;
   });
+}
+
+/* Запас до отпускания в миллиметрах: по какой мере захват ближе всего к расцеплению. Отрицатель
+ * не бывает — как только мера переполняется, конечность уходит. */
+function releaseMargin(g) {
+  let m = 9999;
+  for (const [side, grp] of g.groups) {
+    const ap = aperture(grp.slots), cu = handCurl(side);
+    if (ap.live >= GRAB_MIN_JOINTS && grp.apMin > 0) {
+      m = Math.min(m, (grp.apMin + GRAB_OPEN - ap.ap) * 1000);
+    }
+    if (cu.n >= 2 && grp.curlMin !== null) m = Math.min(m, (grp.curlMin + GRAB_OPEN - cu.curl) * 1000);
+  }
+  return Math.round(m);
+}
+
+/* Отпускание не глушит взятие обратно в тот же миг: после release пальцы всё ещё сидят в
+ * предмете (он маленький, сфера r=35 мм целиком внутри ладони), контакт восстанавливается за
+ * три кадра, и предмет снова едет за рукой — в живом логе пары release|grab шли в одну секунду.
+ * Окно не зависит от того, вышли ли шары из формы: ignoreSet живёт до выхода, а этот запрет —
+ * весь GRAB_GRACE, и считается он тоже шагами. */
+const regrab = new Map();        // "fig|side" -> шагов до конца запрета
+function blockRegab(fig, side) { regrab.set(fig + '|' + side, simSteps + GRACE_STEPS); }
+const regrabBlocked = (fig, side) => (regrab.get(fig + '|' + side) || 0) > simSteps;
+function pruneRegrab() {
+  for (const k of [...regrab.keys()]) if (regrab.get(k) <= simSteps) regrab.delete(k);
 }
 
 /* Пары «фигура <-> сфера руки», которые narrowphase обязана пропустить. Не сталкиваются шары
@@ -897,6 +1019,7 @@ function stepPhysics(n, fill) {
     }
     if (grabOn) { grabDetect(); grabStep(); }
     rebuildIgnore();                     // шары держащей конечности не сталкиваются с фигурой
+    pruneRegrab();
     frameContacts.length = 0;
     ji.Step(DT, 1);
     simSteps++;
@@ -1149,9 +1272,11 @@ function jointStats() {
 function perfLine() {
   const j = jointStats();
   // G — что сейчас в захвате: s5LR = шар держат 5 шаров двух рук. Строка луча короткая,
-  // поэтому id фигуры — одна буква.
+  // поэтому id фигуры — одна буква. m<мм> — запас до отпускания по ближайшей мере: GRAB_OPEN
+  // под живую руку калибруется именно по этим числам (в прошлый заход луч таких не давал, и
+  // «не отпускает» было нечем измерить).
   const G = 'G' + (grabs.size ? [...grabs.values()].map((g) => g.id[0] + allSlots(g).length +
-    sidesOf(g).map((s) => (s ? 'R' : 'L')).join('')).join(',') : '0');
+    sidesOf(g).map((s) => (s ? 'R' : 'L')).join('') + '(m' + releaseMargin(g) + ')').join(',') : '0');
   return ['f' + fps.toFixed(0), 'step' + stepMs.toFixed(1), 'fr' + frameMs.toFixed(1),
     'c' + frameContacts.length, 'v' + maxSpeed.toFixed(2), 'pen' + pen.toFixed(3),
     'lv' + maxOver.toFixed(3), 'j' + j.n + '(' + (j.lo * 1000).toFixed(0) + '-' +
@@ -1302,6 +1427,7 @@ window.__ja = {
     if (o.leash !== undefined) leashMeters = o.leash;
     if (o.hands !== undefined) handsMode = o.hands === 'index' ? 'index' : 'full';
     if (o.proxy !== undefined) showHands = !!o.proxy;
+    if (o.open !== undefined) GRAB_OPEN = o.open;
     if (o.grab !== undefined) {
       grabOn = !!o.grab;
       if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'cfg');
@@ -1341,6 +1467,12 @@ window.__ja = {
   graceList() {
     return grace.map((e) => ({ fig: e.fig, side: e.side, ms: Math.round((e.until - simSteps) * DT * 1000) }));
   },
+  // Запрет повторного взятия после отпускания: fig -> {сторона: шагов до конца}. Тесту нужно
+  // проверить, что release и grab в один кадр больше не бывает.
+  regrabList() {
+    return [...regrab.entries()].map((e) => ({ fig: e[0].split('|')[0], side: +e[0].split('|')[1],
+      steps: e[1] - simSteps }));
+  },
   motion(id) {
     const t = bi.GetMotionType(bodies.get(id));
     return t === Jolt.EMotionType_Kinematic ? 'кинематик' : t === Jolt.EMotionType_Dynamic ? 'динамик' : 'стик';
@@ -1365,10 +1497,18 @@ window.__ja = {
     for (let s = 0; s < 2 * HAND_SLOTS; s++) {
       const t = targets[s];
       t.live = true;
-      t.x = (s < HAND_SLOTS ? -1 : 1) * 3; t.y = 2.5 + (s % 5) * 0.02; t.z = (s % 25) * 0.02;
+      // Растягиваем убранную кисть вдоль Y с шагом 0.1 м: убранная кисть не должна выглядеть
+      // как сжатая. Иначе её кончик и плюсневая кость дают правдоподобную пару (85 мм) и
+      // фантомный CURL по пять пальцев в каждом тесте.
+      t.x = (s < HAND_SLOTS ? -1 : 1) * 3; t.y = 2.5 + (s % 25) * 0.1; t.z = 0;
       t.m.set(IDENT16);
     }
     for (let s = 2 * HAND_SLOTS; s < MAX_SLOTS; s++) targets[s].live = false;
+  },
+  // Кисть пропала из поля трекинга: живые позы обнуляются, как в живом цикле страницы
+  // (каждый кадр targets.live=false, а заливаются только те суставы, что оттреканы).
+  clearHand(side) {
+    for (let j = 0; j < HAND_SLOTS; j++) targets[side * HAND_SLOTS + j].live = false;
   },
   pointer: () => ({ has: ptr.has, ndc: [ptr.x, ptr.y], used: [ptr.usedX, ptr.usedY],
     applied: ptr.applied, target: Object.assign({}, targets[PTR_SLOT]), slot: PTR_SLOT,

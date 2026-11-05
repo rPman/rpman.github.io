@@ -53,9 +53,17 @@ const driver = `
     H.park('cube', 4, 0, 0);
     info0 = H.info();
 
+    // Кнопку выключает асинхронный ответ isSessionSupported, поэтому её нельзя смотреть сразу
+    // после сборки мира: в одном прогоне wasm компилируется дольше, в другом — обещание
+    // приходит позже, и проверка проигрывает гонку (замер: t6 прошла, t7 — нет).
+    var arBtn = document.getElementById('enterAR'), arWait = 0;
+    while (!arBtn.disabled && arWait < 5000) {
+      await new Promise(function (r) { setTimeout(r, 10); });
+      arWait += 10;
+    }
     ok('проба AR не падает: в headless кнопка выключена',
-      document.getElementById('enterAR').disabled === true,
-      'кнопка: ' + JSON.stringify(document.getElementById('enterAR').textContent));
+      arBtn.disabled === true,
+      'кнопка: ' + JSON.stringify(arBtn.textContent) + ', подождал ' + arWait + ' мс');
 
     // A. палец насквозь по оси кольца: материала на пути нет, контактов не будет
     var z = -0.35, touchedAt = null, closest = 9;
@@ -287,7 +295,7 @@ const driver = `
     var gx = squeezeIn(0);
     var g = H.grab()[0];
     ok('два пальца с двух сторон берут шарик в захват', gx !== null && g &&
-      g.id === 'sphere' && g.slots.length >= 2 && H.motion('sphere') === 'кинематик',
+      g.id === 'sphere' && g.slots.length >= 2 && H.motion('sphere') === 'динамик',
       gx === null ? 'захват не включился; контакты: ' +
         JSON.stringify(H.gripDbg()).slice(0, 420) + ' кандидаты: ' +
         JSON.stringify(H.cand()).slice(0, 200) : 'слоты ' + JSON.stringify(g.slots) +
@@ -356,8 +364,8 @@ const driver = `
       Math.abs(afterCarry.x) < 0.02,
       'центр захвата z=' + zc.toFixed(3) + ', шарик z=' + afterCarry.z.toFixed(3) +
       ' x=' + afterCarry.x.toFixed(3) + ' (было z=' + z0.toFixed(3) + '), удерживается после' +
-      ' дожима: ' + stillHeld + ', размах ' + (g && H.grab()[0] ? H.grab()[0].span : '-') +
-      ' при минимуме ' + (H.grab()[0] ? H.grab()[0].spanMin : '-'));
+      ' дожима: ' + stillHeld + ', размах ' + (g && H.grab()[0] ? H.grab()[0].ap : '-') +
+      ' при минимуме ' + (H.grab()[0] ? H.grab()[0].apMin : '-'));
 
     // L4. три шара захвата: их поворот поворачивает шарик (жёсткая подгонка по всем шарам)
     cleanRow();
@@ -404,7 +412,8 @@ const driver = `
     for (var l6 = 0; l6 < 40; l6++) { spread += 0.0015; pin(spread, zc, 1.0); }
     ok('разжатые пальцы отпускают шарик', H.grab().length === 0 &&
       H.motion('sphere') === 'динамик',
-      'размах вырос с ' + gx.toFixed(3) + ' до ' + spread.toFixed(3) + ' м (порог 0.030), ' +
+      'размах вырос с ' + gx.toFixed(3) + ' до ' + spread.toFixed(3) + ' м (порог GRAB_OPEN ' +
+      '0.045), ' +
       'захватов ' + H.grab().length + ', тело: ' + H.motion('sphere') +
       ', шарик: z=' + H.body('sphere').z.toFixed(3) + ' (было ' + relZ.toFixed(3) + ')');
 
@@ -443,16 +452,23 @@ const driver = `
       ', grace: ' + JSON.stringify(H.graceList()) + ', тело: ' + H.motion('sphere') +
       ', контактов в кадре ' + inf7.contacts + ', шарик ' + JSON.stringify(H.body('sphere')));
 
-    // L10. правая в захват не входила — её шары сталкиваются как обычно. Держимый предмет
-    // при этом кинематический, а kinematic<->kinematic контактов не бывает вовсе (замер в
-    // spike.mjs), поэтому толкнуть его нельзя; динамический кубик правая толкает нормально.
+    // L10. правая в захват не входила — её шары сталкиваются как обычно, и держимый предмет
+    // теперь тоже: он остаётся динамиком, поэтому чужой палец его реально толкает (раньше
+    // держимое тело становилось кинематиком, kinematic<->kinematic контактов не давало вовсе,
+    // и предмет был призраком — это и видели глазами на шлеме). Захват при этом удерживает
+    // предмет: он смещается из кадра захвата, но не выпадает из захвата.
     cleanRow();
     squeezeIn(0);
     H.park('cube', 0.45, 0, 0); H.stepTargets(1);
     var ball10 = H.body('sphere');
+    var pushC = 0, pushMax = 0;
     for (var l10 = 0; l10 < 60; l10++) {
       H.setJoint(34, 0.12 - l10 * 0.0015, 0, 0, FR, 0);
       H.stepTargets(1);
+      var b10a = H.body('sphere');
+      pushC = Math.max(pushC, H.info().contacts);
+      pushMax = Math.max(pushMax, Math.hypot(b10a.x - ball10.x, b10a.y - ball10.y,
+        b10a.z - ball10.z));
     }
     var b10 = H.body('sphere');
     var pushedBall = Math.hypot(b10.x - ball10.x, b10.y - ball10.y, b10.z - ball10.z);
@@ -462,10 +478,13 @@ const driver = `
       H.stepTargets(1);
     }
     var pushedCube = Math.abs(H.body('cube').x - cubeA.x);
-    ok('в игноре только держащая рука: кубик правая толкает, держимый шарик — нет',
-      pushedCube > 0.02 && pushedBall < 0.002 && limb10 === 1,
-      'кубик сдвинут на ' + pushedCube.toFixed(3) + ' м, держимый шарик на ' +
-      pushedBall.toFixed(5) + ' м, конечностей в игноре ' + limb10);
+    ok('держимый предмет не призрак: чужой палец его толкает, захват держит',
+      pushC > 0 && pushMax > 0.002 && H.grab().length === 1 && pushedBall < 0.02 &&
+      pushedCube > 0.02 && limb10 === 1,
+      'контактов в кадре максимум ' + pushC + ', шарик сдвинут максимум на ' +
+      pushMax.toFixed(4) + ' м и остался в ' + pushedBall.toFixed(4) + ' м от начала (захват ' +
+      H.grab().length + '), кубик сдвинут на ' + pushedCube.toFixed(3) + ' м, конечностей в ' +
+      'игноре ' + limb10);
 
     // L11. левая держит шарик, правая держит кубик — два независимых захвата сразу
     cleanRow();
@@ -515,7 +534,7 @@ const driver = `
     for (var l13 = 0; l13 < 45; l13++) { sp12 += 0.0015; pin(sp12, 0, 0); pinR(y12, 0, 0); }
     var g13 = H.grab()[0];
     ok('левая разжалась — предмет остался в захвате правой',
-      g13 && g13.sides.length === 1 && H.motion('sphere') === 'кинематик',
+      g13 && g13.sides.length === 1 && H.motion('sphere') === 'динамик',
       g13 ? sidesOfGrab() + ' слоты ' + JSON.stringify(g13.slots) + ', левая разжата до ' +
       sp12.toFixed(3) + ' м, тело: ' + H.motion('sphere') : 'захвата нет');
     var zc13 = 0;
@@ -525,6 +544,132 @@ const driver = `
       Math.abs(b13.z - zc13) < 0.02 && H.grab().length === 1,
       'правая на z=' + zc13.toFixed(3) + ', шарик z=' + b13.z.toFixed(3) + ', захватов ' +
       H.grab().length);
+    H.parkFingers(); H.stepTargets(3);
+
+    // L17. два держимых предмета упираются друг в друга, а не проходят насквозь. На живом
+    // заходе именно это и видели: левая держит шарик, правая ведёт кубик — и их линии
+    // пересекаются, потому что держимое тело было кинематиком, а kinematic<->kinematic
+    // контактов не бывает вовсе (замер в spike.mjs).
+    cleanRow();
+    var gx17 = squeezeIn(0);                      // левая держит шарик в (0,0,0)
+    H.park('cube', 0, 0.45, 0); H.stepTargets(1);
+    for (var l17a = 0; l17a < 90; l17a++) {
+      var d17a = 0.13 - l17a * 0.0015;
+      H.setJoint(34, 0, 0.45 + d17a, 0, FR, 0);
+      H.setJoint(39, 0, 0.45 - d17a, 0, FR, 0);
+      H.stepTargets(1);
+      if (H.grab().length === 2) break;
+    }
+    var held17 = H.grab().length === 2;
+    var minGap17 = 9, pen17 = 0, cont17 = 0, Y17 = 0.45, blocked17 = 0, ballAway = 0;
+    for (var l17 = 0; l17 < 200; l17++) {
+      Y17 = Math.max(0.03, 0.45 - l17 * 0.003);   // кадр захвата лезет в шарик на 5.5 см
+      // Кубик ведут вдоль Y: ось захвата левой (шары 9 и 14) лежит вдоль X, и по ней кубик
+      // упёрся бы в палец левой, а не в шарик (замер: встал в 0.1125 м от центра шарика).
+      H.setJoint(34, 0.02, Y17, 0, FR, 0);
+      H.setJoint(39, -0.02, Y17, 0, FR, 0);
+      H.setJoint(9, gx17, 0, 0, FR, 0);           // левая при этом стоит
+      H.setJoint(14, -gx17, 0, 0, FR, 0);
+      H.stepTargets(1);
+      var bc17 = H.body('cube'), bs17 = H.body('sphere'), i17 = H.info();
+      minGap17 = Math.min(minGap17, Math.hypot(bc17.x - bs17.x, bc17.y - bs17.y, bc17.z - bs17.z));
+      pen17 = Math.max(pen17, i17.pen);
+      cont17 = Math.max(cont17, i17.contacts);
+      blocked17 = Math.max(blocked17, bc17.y - Y17);
+      ballAway = Math.max(ballAway, Math.hypot(bs17.x, bs17.y, bs17.z));
+    }
+    ok('два держимых предмета упираются, а не проходят друг сквозь друга',
+      held17 && cont17 > 0 && minGap17 > 0.08 && minGap17 < 0.105 &&
+      blocked17 > 0.03 && ballAway < 0.06 && H.grab().length === 2,
+      'минимум расстояния центров ' + minGap17.toFixed(4) + ' м (шар r=0.035 + половина куба ' +
+      '0.05 = 0.085), контактов в кадре максимум ' + cont17 + ', проникновение ' +
+      pen17.toFixed(4) + ' м, кубик не дошёл до кадра захвата на ' + blocked17.toFixed(4) +
+      ' м (кадр лезет на 0.055 м вглубь; у кинематика на этом месте было бы 0.000 м), ' +
+      'шарик уведён максимум на ' + ballAway.toFixed(4) + ' м, захватов в конце ' +
+      H.grab().length);
+
+    // L14/L15/L16 — три способа отпускания, найденные живым заходом на PICO 2026-11-05: предмет
+    // висел в захвате по 10-14 с (отпускал только loss), а release и grab шли в одну секунду.
+    // Лог: /tmp/arhands/live1.log (луч с шлема), правила — в ar-page.js («ПО ЧЕМУ СУДЯТ О
+    // РАЗЖАТИИ»).
+
+    // L14. ладонь раскрылась, а шары захвата никуда не двинулись (остались внутри предмета).
+    // Размах державших шаров при этом не растёт вовсе — именно так и выглядело «не отпускает».
+    // Раскрытие судится по CURL: |кончик − его плюсневая кость| по пальцам кисти.
+    cleanRow();
+    var gx14 = squeezeIn(0);
+    // плюсневая кость рядом с кончиком = палец согнут; уводим её вниз = палец разгибается,
+    // кончики при этом стоят внутри шарика
+    function l14hand(yb) {
+      H.setJoint(5, 0.02, yb, 0, FR, 0);          // index-metacarpal левой
+      H.setJoint(10, -0.02, yb, 0, FR, 0);        // middle-metacarpal левой
+      H.setJoint(9, 0.02, 0, 0, FR, 0);           // кончики внутри шарика
+      H.setJoint(14, -0.02, 0, 0, FR, 0);
+      H.stepTargets(1);
+    }
+    l14hand(-0.07); l14hand(-0.07);
+    var c14 = H.grab()[0], curl0 = c14 ? c14.s0.curl : null, ap0 = c14 ? c14.s0.ap : null;
+    var openAt14 = -1;
+    for (var l14 = 0; l14 < 40; l14++) {
+      l14hand(-0.07 - l14 * 0.003);
+      if (!H.grab().length) { openAt14 = l14; break; }
+    }
+    ok('раскрытая ладонь отпускает, даже когда шары захвата стояли на месте',
+      curl0 !== null && Math.abs(curl0 - 0.07) < 0.005 && openAt14 > 8 &&
+      H.motion('sphere') === 'динамик',
+      'curl ' + curl0 + ' -> ' + (0.07 + openAt14 * 0.003).toFixed(3) + ' м при неподвижном ' +
+      'размахе ' + ap0 + ' м; отпущено на шаге ' + openAt14 + ' (порог GRAB_OPEN 0.045), тело: ' +
+      H.motion('sphere'));
+
+    // L15. мигание трекинга (3 кадра кисти нет, 1 кадр есть) предмет не отпускает, а
+    // настоящая потеря за полсекунды — отпускает.
+    cleanRow();
+    var gx15 = squeezeIn(0);
+    for (var l15 = 0; l15 < 12; l15++) {
+      H.clearHand(0); H.stepTargets(1);
+      H.clearHand(0); H.stepTargets(1);
+      H.clearHand(0); H.stepTargets(1);
+      pin(gx15, 0, 0);                            // кадр, когда кисть вернулась
+    }
+    var g15 = H.grab()[0];
+    for (var l15c = 0; l15c < 40; l15c++) pin(gx15, 0, 0);   // счёт остывает на живых кадрах
+    var lostAt15 = -1;
+    for (var l15b = 0; l15b < 60; l15b++) {
+      H.clearHand(0); H.stepTargets(1);
+      if (!H.grab().length) { lostAt15 = l15b; break; }
+    }
+    ok('мигание трекинга держит предмет, а потеря кисти на полсекунды отпускает',
+      g15 && g15.s0.lost < 36 && lostAt15 > 30 && lostAt15 < 42,
+      'после 12 миганий счёт потери ' + (g15 ? g15.s0.lost : '—') + ' (порог 36 шагов); ' +
+      'сплошная потеря отпустила на шаге ' + lostAt15 + ' из 60');
+
+    // L16. отпустил — обратно тот же предмет не берётся, пока пальцы всё ещё в нём: в живом
+    // логе release и grab шли в одну секунду, и предмет выглядел приваренным к кисти.
+    cleanRow();
+    squeezeIn(0);
+    function l16hand(yb, wig) {
+      H.setJoint(5, 0.02, yb, 0, FR, 0);
+      H.setJoint(10, -0.02, yb, 0, FR, 0);
+      H.setJoint(9, 0.02 + wig, 0, 0, FR, 0);
+      H.setJoint(14, -0.02 - wig, 0, 0, FR, 0);
+      H.stepTargets(1);
+    }
+    var rel16 = -1;
+    for (var l16 = 0; l16 < 40; l16++) {
+      l16hand(-0.07 - l16 * 0.003, 0);
+      if (!H.grab().length) { rel16 = l16; break; }
+    }
+    var ban16 = H.regrabList();
+    for (var l16b = 0; l16b < 30; l16b++) l16hand(-0.19, 0.006 * Math.sin(l16b * 0.5));
+    var stillFree = H.grab().length === 0;
+    for (var l16c = 0; l16c < 70; l16c++) l16hand(-0.19, 0.006 * Math.sin((30 + l16c) * 0.5));
+    var re16 = H.grab().length;
+    ok('тот же предмет не берётся обратно, пока палец в нём и не прошёл таймаут',
+      rel16 > 8 && ban16.length === 1 && stillFree && re16 === 1,
+      'отпущено на шаге ' + rel16 + '; запрет взятия: ' + JSON.stringify(ban16) +
+      '; через 30 кадров палец всё ещё внутри — захватов ' + (stillFree ? 0 : 1) +
+      '; ещё через 70 (таймаут GRAB_GRACE 1 с прошёл) — захватов ' + re16);
+
     H.parkFingers(); H.stepTargets(3);
 
     // E. place() — «перед собой»: якоря и тела совпадают
