@@ -55,7 +55,13 @@ const QS = new URLSearchParams(location.search);
 let handsMode = QS.get('hands') === 'index' ? 'index' : 'full';
 let showHands = QS.get('proxy') !== '0';
 
-const MIN_JOINT_R = 0.004, MAX_JOINT_R = 0.03, FINGER_R0 = 0.011, PAD_R = 0.020;
+/* XR-радиус сустава на PICO щедрее реальной руки: ладонь выходила вдвое толще настоящей, а
+ * соседние суставы сливались в один комок (замечание владельца 2026-11-04). Кисть строится с
+ * половинным радиусом: JOINT_R_SCALE умножается на XR-радиус ДО clamp'а, а границы clamp'а уже
+ * уменьшенные — иначе самый мелкий сустав упёрся бы в прежнее дно 4 мм и половинки бы не вышло.
+ * Контроллер (PAD_R) и курсор превью (FINGER_R0) — не кисть, они не меняются. */
+const JOINT_R_SCALE = 0.5;
+const MIN_JOINT_R = 0.002, MAX_JOINT_R = 0.015, FINGER_R0 = 0.011, PAD_R = 0.020;
 const BEACON = 'https://yokko.duckdns.org/ar-ht/rep.gif';
 let leashMeters = isFinite(+QS.get('leash')) && +QS.get('leash') > 0 ? +QS.get('leash') : 0.9;
 let beaconOn = !QS.has('nobeacon');
@@ -623,7 +629,7 @@ function readHand(s, side, frame, refSpace) {
     }
     if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
     const t = targets[handSlot(side, j)];
-    t.x = x; t.y = y; t.z = z; t.r = clampR(r); t.live = true;
+    t.x = x; t.y = y; t.z = z; t.r = clampR(r * JOINT_R_SCALE); t.live = true;
     if (fast) {
       const o = j * 16;
       for (let k = 0; k < 16; k++) t.m[k] = pose16[o + k];
