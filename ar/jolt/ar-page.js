@@ -139,6 +139,7 @@ handMesh.count = MAX_SLOTS;
 scene.add(handMesh);
 
 const touchMeshes = [];
+let gripDots = 0;                        // сколько маркеров в кадре — это держатели, не касания
 // 48 маркеров: кисть из 25 сфер легко даёт больше контактов, чем 24, а молча не дорисованные
 // точки выглядят как расходимость чисел в HUD.
 for (let i = 0; i < 48; i++) {
@@ -340,11 +341,25 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  * держать динамиком). Цена: предмет отстаёт от кисти на долю шага (GRAB_FOLLOW) и его можно
  * вытолкнуть из захвата, если толкать сильнее, чем ведёт захват.
  *
- * КАДР ЗАХВАТА — жёсткая подгонка (Kabsch/Procrustes) по всем шарам захвата обеих рук: центр —
- * средневзвешенный по радиусам центр всех державших шаров, поворот — тот, что лучше всего
- * совмещает их текущую конфигурацию с конфигурацией момента захвата. Он определён только для
- * ≥3 неколлинеарных шаров; иначе предмет только переезжает, но не крутится — раньше ориентацию
- * брали с матрицы одного сустава ровно потому, что двух пальцев для поворота не хватает.
+ * КАДР ЗАХВАТА — каждый шар захвата помнит ТОЧКУ ТЕЛА, в которой он его взял (местные оси
+ * фигуры, снимаются при взятии и при входе конечности). Держать — значит требовать, чтобы эти
+ * точки тела шли за шарами рук: средний перенос даёт перенос предмета, то, что среднему
+ * переносу не объясняется, объясняется поворотом (малый угол методом наименьших квадратов,
+ * dθ = Σ w·r×d / Σ w·|r|²), а то, что не объясняется ничем, и есть невязка (см. SPREAD).
+ * Это жёсткая подгонка по всем шарам захвата обеих рук — как и решил владелец, — только
+ * считающаяся относительно ТЕЛА, а не относительно кадра момента взятия. Прежний Kabsch по
+ * мировым конфигурациям имел две живые дыры:
+ *   • вырожденная конфигурация отбрасывалась целиком (A.length < 3 и ранг < 2 → поворота нет
+ *     вовсе). Куб (ребро 100 мм) ладонью одной руки — это 2-5 шаров на одной грани: живой лог
+ *     2026-11-05 даёт grab|cube|2|R и grab|cube|4|R, то есть поворот был запрещён по построению.
+ *     Бублик (труба 25 мм) пальцы обхватывают, конфигурация объёмная — он крутился. Отсюда и
+ *     жалоба владельца «тор одной рукой крутится, куб одной рукой только едет».
+ *   • при пропаже любого шара захвата кадр переснимался (reanchor), а с ним обнулялись и
+ *     накопленный поворот, и позиция отсчёта — на мигающем трекинге PICO это происходило
+ *     несколько раз в секунду, и ориентация не успевала накопиться.
+ * У направления, которого шары захвата не видят (закручивание вокруг оси пары), числитель
+ * просто нулевой: предмет по нему не крутится и ничего не выдумывается — ветка «вырождено»
+ * больше не нужна, как и SVD (якобиана 24 свечи на каждый шаг была самой дорогой частью цикла).
  *
  * ОТПУСКАЕТ КОНЕЧНОСТЬ, а не весь захват: у каждой руки свои счётчики разжима и потери.
  * Вышедшая конечность перестаёт сталкиваться с фигурой ещё на GRAB_GRACE секунд — или пока её
@@ -364,17 +379,27 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  *   CURL — среднее |кончик пальца − его плюсневая кость| по пальцам, чьи суставы видены и
  *     стоят правдоподобно близко. Это сгиб самих пальцев: кулак ≈ 60-80 мм, раскрытая кисть
  *     ≈ 160-190 мм. Работает и когда в захвате один шар (у щепотки размах оценить нечем).
- * Ни одна из них не измеряет расстояние до предмета: предмет едет за кистью, поэтому по нему
- * раскрывание ладони невидимо вовсе.
+ * Ни APERTURE, ни CURL не измеряют расстояние до предмета: предмет едет за кистью, поэтому по
+ * нему раскрывание ладони невидимо вовсе (за это расстояние отвечает SLIP, см. ниже).
  *   SPREAD — третья мера, и у неё другой предмет: РАЗЪЕЗД ДВУХ ДЕРЖАЩИХ РУК. Когда предмет
  * держат две конечности, ни aperture, ни curl разъезд не замечают: ладонь сама по себе остаётся
- * ладонью, её размах и сгиб не меняются, пока кисть не менялась. Живой замер 2026-11-05:
+ * ладонью, её размах и сгиб не меняются, пока не менялась она сама. Живой замер 2026-11-05:
  * `grab|cube|8|R,L`, 22 с `Gc8RL(m45→11)` и ни одного отпускания, пока левая кисть не пропала
- * из трекинга (leave|cube|L|lost). Заодно ломается и кадр захвата: Kabsch по восьми сферах двух
- * разъехавшихся кистей подгоняет несуществующую жёсткую конфигурацию, поэтому предмет начинает
- * вращаться на пустом месте. Меряется расстояние между центрами шаров держящих конечностей:
- * вырос больше GRAB_SPREAD относительно самого сжатого кадра — хватка рвётся, предмет отпускают
- * обе руки. При одной держящей конечности мера не работает вовсе (предмет и так едет за ней).
+ * из трекинга (leave|cube|L|lost). Мера — НЕВЯЗКА КАДРА ЗАХВАТА: та часть рассогласования
+ * шаров с точками тела, которую не объясняет ни один жёсткий перенос с поворотом (RMS по шарам).
+ * При жёстком переносе двумя руками она нулевая по построению, при разъезде растёт примерно
+ * вдвое медленнее самого разъезда. Больше GRAB_FIT — хватки нет ни у кого, отпускают обе руки
+ * сразу (`?fit=80`). При одной держящей конечности мера не работает вовсе (предмет и так едет
+ * за ней, и иначе дрожание одного сустава рвало бы удержание).
+ *   SLIP — четвёртая мера, и она одна смотрит на ПРЕДМЕТ, а не на кисть: как далеко шары
+ * захвата от его поверхности (минимум по живым шарам конечности: если хоть один шар ещё внутри
+ * формы, значение отрицательное и рука сидит на предмете). Три прежние меры устроены так, что
+ * увод руки от предмета их не трогает вовсе, а предмет при этом может не донестись: он упёрся
+ * в поводок, в другую фигуру или в предел скорости — и тогда рука ходит, а предмет висит рядом.
+ * Живой замер 2026-11-05 (последняя попытка): `grab|cube|4|R` продержался 7 с при v 2.29 м/с
+ * (ведение упёрто в MAX_SPEED 2.5), и отпустило только по CURL, когда пальцы наконец разогнулись
+ * на +87 мм. Если все шары державшей конечности вышли из формы на GRAB_SLIP и продержались так
+ * GRAB_SLIP_FRAMES шагов — конечность отпускает (`?slip=80`).
  */
 const GRAB_MIN_JOINTS = 2;       // минимум разных суставов, чтобы держать
 const GRAB_FRAMES = 3;           // сколько кадров подряд условие держится до включения
@@ -395,12 +420,17 @@ let GRAB_FOLLOW = isFinite(+QS.get('follow')) && +QS.get('follow') > 0 ?
   Math.min(1, +QS.get('follow')) : 0.6;
 const GRAB_TELEPORT = 0.25;      // м: крупный разрыв уходит в телепорт, как у пальцев
 const GRAB_JOINT_REACH = 0.25;   // м: дальше этого сустав не «палец этой кисти» (в тестах кисти убраны)
-/* Насколько державшие шары могут перестать напоминать одно жёсткое целое (RMS невязки
- * подгонки, метры). Смысл — хватка рвётся, когда две руки разъезжаются: предмет нельзя держать
+/* Насколько державшие шары могут перестать напоминать одно жёсткое целое (RMS невязки кадра
+ * захвата, метры). Смысл — хватка рвётся, когда две руки разъезжаются: предмет нельзя держать
  * ладонями в полуметре друг от друга. Правится на ходу: ?fit=80 (миллиметры). */
 let GRAB_FIT = isFinite(+QS.get('fit')) && +QS.get('fit') > 0 ? +QS.get('fit') / 1000 : 0.06;
+/* Насколько ВСЕ шары державшей конечности могут выйти из формы, чтобы считалось, что рука ушла,
+ * а предмет не донёсся (метры; внутри формы значение отрицательное). Порог заведомо больше
+ * HAND_PAD и penetration slop: при взятии шар сидит на поверхности, то есть зазор ≤ 8 мм.
+ * Правится на ходу: ?slip=80 (миллиметры). */
+let GRAB_SLIP = isFinite(+QS.get('slip')) && +QS.get('slip') > 0 ? +QS.get('slip') / 1000 : 0.06;
+const GRAB_SLIP_FRAMES = 18;     // кадров подряд (0.25 с) вне формы, прежде чем отпустить
 const GRAB_GRACE = 1.0;          // с: ещё столько снятая конечность не трогает выпущенную фигуру
-const FIT_RANK = 0.1;            // σ3/σ2 ниже — конфигурация вырождена, поворот не берём
 let grabOn = QS.get('grab') !== '0';
 const grabs = new Map();         // fig id -> захват: одна фигура = один захват
 const grabbed = new Set();       // id фигур в захвате
@@ -609,170 +639,72 @@ function surfaceInfo(fig, x, y, z) {
   return { gap, nx: vNrm.x, ny: vNrm.y, nz: vNrm.z };
 }
 
-/* Живые шары захвата (шары всех конечностей) и их взвешенный по радиусам центр. */
-function gripPoints(g) {
-  const pts = [];
-  let w = 0, cx = 0, cy = 0, cz = 0;
-  for (const s of allSlots(g)) {
+/* Рассогласование кадра: для каждого живого шара — его якорь в мировых осях (r) и насколько
+ * шар от него уехал (d). Среднее по весам (радиусам шаров) даёт перенос, разброс вокруг среднего
+ * — поворот и невязку. Буферы общие на кадр: 52 якоря на 72 Гц — это тысячи объектов в минуту. */
+const anQ = new THREE.Quaternion(), anV = new THREE.Vector3();
+const anR = new Float64Array(MAX_SLOTS * 3), anD = new Float64Array(MAX_SLOTS * 3),
+  anW = new Float64Array(MAX_SLOTS);
+
+/* Кадр захвата: для каждого шара захвата помним точку ТЕЛА, в которой он этот предмет взял.
+ * Местные оси фигуры — те же, что у surfaceInfo (шар r, куб half, кольцо R/tube), поэтому якорь
+ * переживает и поворот, и перенос предмета, и пропажу/приход любого шара: переснимать кадр целиком
+ * больше нечем, а с пересъёмом умирал и накопленный поворот (прежний reanchor обнулял qFit).
+ * Снимается при взятии и при входе конечности; при её выходе её якоря просто удаляются. */
+function captureAnchors(g, slots) {
+  const b = bodies.get(g.id), p = posOf(b), qj = bi.GetRotation(b);
+  anQ.set(qj.GetX(), qj.GetY(), qj.GetZ(), qj.GetW()).invert();
+  for (const s of slots) {
     const t = targets[s];
     if (!t.live) continue;
-    pts.push({ x: t.x, y: t.y, z: t.z, w: t.r });
-    cx += t.x * t.r; cy += t.y * t.r; cz += t.z * t.r; w += t.r;
+    anV.set(t.x - p.x, t.y - p.y, t.z - p.z).applyQuaternion(anQ);
+    g.anch.set(s, { x: anV.x, y: anV.y, z: anV.z, w: t.r });
   }
-  if (w > 0) { cx /= w; cy /= w; cz /= w; }
-  return { pts, n: pts.length, cx, cy, cz, w };
+}
+function dropAnchors(g, side) {
+  for (const k of [...g.anch.keys()]) if (handOfSlot(k) === side) g.anch.delete(k);
 }
 
-/* Переснять кадр: конфигурация шаров и поза фигуры берутся «как сейчас». Нужно при взятии, при
- * входе/выходе конечности и когда состав живых шаров изменился: иначе подгонка считает поворот
- * от устаревшей конфигурации, и предмет подпрыгивает. */
-function reanchor(g) {
-  const cur = gripPoints(g);
-  if (!cur.n || cur.w <= 0) return false;
-  g.pts0 = cur.pts.map((p) => ({ x: p.x, y: p.y, z: p.z, w: p.w }));
-  g.c0 = { x: cur.cx, y: cur.cy, z: cur.cz };
-  const b = bodies.get(g.id), p = posOf(b), q = bi.GetRotation(b);
-  g.p0 = { x: p.x, y: p.y, z: p.z };
-  g.q0 = { x: q.GetX(), y: q.GetY(), z: q.GetZ(), w: q.GetW() };
-  g.qFit.set(0, 0, 0, 1);
-  return true;
-}
-
-/* Якобиана симметричной 3×3: A = V diag(lam) Vᵀ, столбцы V — собственные векторы. */
-function jacobi3(aIn) {
-  const a = aIn.slice();
-  const V = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-  for (let sweep = 0; sweep < 24; sweep++) {
-    if (a[1] * a[1] + a[2] * a[2] + a[5] * a[5] < 1e-24) break;
-    for (let it = 0; it < 3; it++) {
-      const p = [0, 0, 1][it], q = [1, 2, 2][it];
-      const apq = a[p * 3 + q];
-      if (Math.abs(apq) < 1e-18) continue;
-      const th = (a[q * 3 + q] - a[p * 3 + p]) / (2 * apq);
-      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
-      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
-      for (let k = 0; k < 3; k++) {                       // A <- A·J (столбцы)
-        const x = a[k * 3 + p], y = a[k * 3 + q];
-        a[k * 3 + p] = c * x - s * y; a[k * 3 + q] = s * x + c * y;
-      }
-      for (let k = 0; k < 3; k++) {                       // A <- Jᵀ·A (строки)
-        const x = a[p * 3 + k], y = a[q * 3 + k];
-        a[p * 3 + k] = c * x - s * y; a[q * 3 + k] = s * x + c * y;
-      }
-      for (let k = 0; k < 3; k++) {                       // V <- V·J
-        const x = V[k * 3 + p], y = V[k * 3 + q];
-        V[k * 3 + p] = c * x - s * y; V[k * 3 + q] = s * x + c * y;
-      }
-    }
+function gripMatch(g, p, q) {
+  let n = 0, w = 0, rx = 0, ry = 0, rz = 0, dx = 0, dy = 0, dz = 0;
+  for (const [slot, a] of g.anch) {
+    const t = targets[slot];
+    if (!t.live) continue;
+    anV.set(a.x, a.y, a.z).applyQuaternion(q);
+    const o = n * 3;
+    anR[o] = anV.x; anR[o + 1] = anV.y; anR[o + 2] = anV.z;
+    anD[o] = t.x - p.x - anV.x; anD[o + 1] = t.y - p.y - anV.y; anD[o + 2] = t.z - p.z - anV.z;
+    anW[n] = a.w; w += a.w;
+    rx += a.w * anV.x; ry += a.w * anV.y; rz += a.w * anV.z;
+    dx += a.w * anD[o]; dy += a.w * anD[o + 1]; dz += a.w * anD[o + 2];
+    n++;
   }
-  return { lam: [a[0], a[4], a[8]], V };
-}
-
-function mm3(a, b) {
-  const o = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-  for (let r = 0; r < 3; r++) {
-    o[r * 3] = a[r * 3] * b[0] + a[r * 3 + 1] * b[3] + a[r * 3 + 2] * b[6];
-    o[r * 3 + 1] = a[r * 3] * b[1] + a[r * 3 + 1] * b[4] + a[r * 3 + 2] * b[7];
-    o[r * 3 + 2] = a[r * 3] * b[2] + a[r * 3 + 1] * b[5] + a[r * 3 + 2] * b[8];
-  }
-  return o;
-}
-
-/* Kabsch: поворот R, минимизирующий Σ w·|R·(p0−c0) − (p−c)|². SVD 3×3 — через якобиану HᵀH.
- * Хватает ранга 2: три шара всегда лежат в одной плоскости (относительно своего центра), и
- * поворот вокруг нормали к ней определён; «закручивание» вне плоскости не определено никогда,
- * поэтому третья колонка U добирается векторным произведением и детерминант фиксируется +1 —
- * это минимальный поворот. Ранг 1 (два шара, всё на одной прямой) — поворота нет, только перенос. */
-const fitM = new THREE.Matrix4();
-function hv3(H, v) {
-  return [H[0] * v[0] + H[1] * v[1] + H[2] * v[2],
-    H[3] * v[0] + H[4] * v[1] + H[5] * v[2],
-    H[6] * v[0] + H[7] * v[1] + H[8] * v[2]];
-}
-function fitGrip(g, cur) {
-  const A = g.pts0, B = cur.pts;
-  if (A.length < 3 || B.length !== A.length) return false;
-  const H = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-  for (let i = 0; i < A.length; i++) {
-    const w = A[i].w;
-    const ax = (A[i].x - g.c0.x) * w, ay = (A[i].y - g.c0.y) * w, az = (A[i].z - g.c0.z) * w;
-    const bx = B[i].x - cur.cx, by = B[i].y - cur.cy, bz = B[i].z - cur.cz;
-    H[0] += bx * ax; H[1] += bx * ay; H[2] += bx * az;
-    H[3] += by * ax; H[4] += by * ay; H[5] += by * az;
-    H[6] += bz * ax; H[7] += bz * ay; H[8] += bz * az;
-  }
-  const Bt = [
-    H[0] * H[0] + H[3] * H[3] + H[6] * H[6],
-    H[0] * H[1] + H[3] * H[4] + H[6] * H[7],
-    H[0] * H[2] + H[3] * H[5] + H[6] * H[8],
-    H[1] * H[0] + H[4] * H[3] + H[7] * H[6],
-    H[1] * H[1] + H[4] * H[4] + H[7] * H[7],
-    H[1] * H[2] + H[4] * H[5] + H[7] * H[8],
-    H[2] * H[0] + H[5] * H[3] + H[8] * H[6],
-    H[2] * H[1] + H[5] * H[4] + H[8] * H[7],
-    H[2] * H[2] + H[5] * H[5] + H[8] * H[8],
-  ];
-  const e = jacobi3(Bt);
-  const sig = e.lam.map((l) => Math.sqrt(Math.max(0, l)));
-  const ord = [0, 1, 2].sort((p, q) => sig[q] - sig[p]);
-  if (sig[ord[1]] < 1e-12 || sig[ord[1]] < FIT_RANK * sig[ord[0]]) return false;
-  const colV = (k) => [e.V[k], e.V[3 + k], e.V[6 + k]];
-  /* Колонки U берём из SVD пока σ определён; недобранную добираем векторным произведением.
-   * Для трёх шаров σ3 = 0 всегда (три точки относительно своего центра плоские), и именно
-   * эта замена превращает неопределённое «закручивание» в минимальный поворот. */
-  const u = [];
-  for (let i = 0; i < 3; i++) {
-    const k = ord[i], s = sig[k];
-    if (s < 1e-12) break;
-    u.push(hv3(H, colV(k)).map((x) => x / s));
-  }
-  if (u.length < 2 || sig[ord[1]] < FIT_RANK * sig[ord[0]]) return false;
-  if (u.length < 3) {
-    const c = [u[0][1] * u[1][2] - u[0][2] * u[1][1], u[0][2] * u[1][0] - u[0][0] * u[1][2],
-      u[0][0] * u[1][1] - u[0][1] * u[1][0]];
-    const l3 = Math.hypot(c[0], c[1], c[2]) || 1e-9;
-    u.push([c[0] / l3, c[1] / l3, c[2] / l3]);
-  }
-  const U = [u[0][0], u[1][0], u[2][0], u[0][1], u[1][1], u[2][1], u[0][2], u[1][2], u[2][2]];
-  // Vᵀ в том же порядке сингулярных троек, что и колонки U, иначе R перемешивает направления.
-  const vc = [colV(ord[0]), colV(ord[1]), colV(ord[2])];
-  const Vt = [vc[0][0], vc[0][1], vc[0][2], vc[1][0], vc[1][1], vc[1][2], vc[2][0], vc[2][1], vc[2][2]];
-  const UVt = mm3(U, Vt);
-  const det = UVt[0] * (UVt[4] * UVt[8] - UVt[5] * UVt[7]) -
-    UVt[1] * (UVt[3] * UVt[8] - UVt[5] * UVt[6]) +
-    UVt[2] * (UVt[3] * UVt[7] - UVt[4] * UVt[6]);
-  const R = mm3(mm3(U, [1, 0, 0, 0, 1, 0, 0, 0, det >= 0 ? 1 : -1]), Vt);
-  fitM.set(R[0], R[1], R[2], 0, R[3], R[4], R[5], 0, R[6], R[7], R[8], 0, 0, 0, 0, 1);
-  g.qFit.setFromRotationMatrix(fitM);
-  return true;
-}
-
-/* Невязка подгонки, метры: RMS расстояния между текущими шарами захвата и конфигурацией момента
- * взятия, повёрнутой на qFit. При жёстком переносе и повороте кистей она равна нулю по
- * построению, а растёт только когда державшие шары разошлись НЕ как одно целое — то есть когда
- * хватки фактически уже нет. Именно этого не видят aperture и curl: у каждой руки свои счётчики,
- * а разъезд ДВУХ рук не меняет ни размах, ни сгиб каждой по отдельности (живой замер: куб в двух
- * ладонях, руки разъехались — 22 с в захвате, m упало только до 11 мм).
- * Считается только для успешной подгонки: при вырожденной конфигурации qFit остаётся прежним,
- * и невязка по нему — не про реальность. */
-const rvA = new THREE.Vector3();
-function gripResidual(g, cur) {
-  const A = g.pts0, B = cur.pts;
-  if (A.length < 3 || B.length !== A.length) return 0;
-  let s = 0, w = 0;
-  for (let i = 0; i < A.length; i++) {
-    rvA.set(A[i].x - g.c0.x, A[i].y - g.c0.y, A[i].z - g.c0.z).applyQuaternion(g.qFit);
-    const dx = rvA.x - (B[i].x - cur.cx), dy = rvA.y - (B[i].y - cur.cy), dz = rvA.z - (B[i].z - cur.cz);
-    s += A[i].w * (dx * dx + dy * dy + dz * dz);
-    w += A[i].w;
-  }
-  return w > 0 ? Math.sqrt(s / w) : 0;
+  if (!n || w <= 0) return null;
+  return { n, w, rx: rx / w, ry: ry / w, rz: rz / w, dx: dx / w, dy: dy / w, dz: dz / w };
 }
 
 function addGroup(g, side, slots) {
   const ap = aperture(slots), cu = handCurl(side);
   g.groups.set(side, { slots: slots.slice(), apMin: ap.ap, curlMin: cu.n >= 2 ? cu.curl : null,
-    lost: 0 });
+    lost: 0, slip: 0 });
+}
+
+/* Насколько шары захвата этой конечности всё ещё сидят НА предмете: минимум по живым шарам от
+ * (зазор до поверхности минус радиус шара). Пока хоть один шар внутри формы, значение
+ * отрицательное — рука на предмете. Положительное и большое значит, что вся конечность ушла, а
+ * предмет не донёсся: он упёрся в поводок/фигуру/предел скорости. Единственная из мер, которая
+ * смотрит на предмет, а не на кисть (см. SLIP в описании отпускания). */
+function gripGap(g, side) {
+  const grp = g.groups.get(side);
+  if (!grp) return null;
+  let out = null;
+  for (const s of grp.slots) {
+    const t = targets[s];
+    if (!t.live) continue;
+    const v = surfaceInfo(g.id, t.x, t.y, t.z).gap - slotR[s];
+    if (out === null || v < out) out = v;
+  }
+  return out;
 }
 
 /* Конечность перестаёт трогать фигуру: во время захвата — пока держит, после отпускания ещё
@@ -784,8 +716,8 @@ function addGrace(fig, side) {
 }
 
 function grabStart(c) {
-  const g = { id: c.fig, groups: new Map(), pts0: [], c0: null, p0: null, q0: null,
-    qFit: new THREE.Quaternion(), lin: null, ang: null, resid: 0 };
+  const g = { id: c.fig, groups: new Map(), anch: new Map(), lin: null, ang: null,
+    resid: 0 };
   const bySide = new Map();
   for (const s of c.slots) {
     const side = handOfSlot(s);
@@ -797,18 +729,19 @@ function grabStart(c) {
   grabbed.add(c.fig);
   // поводок на время захвата считается от точки захвата: иначе рука не донесла бы фигуру
   anchors.set(c.fig, posOf(bodies.get(c.fig)));
-  reanchor(g);
+  captureAnchors(g, c.slots);
   beacon('grab|' + c.fig + '|' + allSlots(g).length + '|' +
     sidesOf(g).map((s) => (s ? 'R' : 'L')).join(','));
 }
 
-/* Вторая конечность вошла в идущий захват (держит ТОТ ЖЕ предмет): центр и поворот теперь
- * считаются по шарам обеих рук. Сменился состав — кадр переснимается, иначе предмет дёрнется. */
+/* Вторая конечность вошла в идущий захват (держит ТОТ ЖЕ предмет): её шары получают якоря на
+ * теле предмета, и дальше кадр считается по шарам обеих рук. Прежний reanchor при этом переснимал
+ * ВЕСЬ кадр и обнулял накопленный поворот — теперь чужие якоря не трогаются вовсе. */
 function grabJoin(c) {
   const g = grabs.get(c.fig);
   if (!g || g.groups.has(c.side)) return;
   addGroup(g, c.side, c.slots);
-  reanchor(g);
+  captureAnchors(g, c.slots);
   beacon('join|' + c.fig + '|' + (c.side ? 'R' : 'L') + '|' + c.slots.length);
 }
 
@@ -816,11 +749,10 @@ function grabJoin(c) {
  * это решено: порог калибруется только живыми замерами, угадать его по документации нельзя. */
 function groupLeave(g, side, why, dbg) {
   g.groups.delete(side);
+  dropAnchors(g, side);
   addGrace(g.id, side);
   blockRegab(g.id, side);
   beacon('leave|' + g.id + '|' + (side ? 'R' : 'L') + '|' + why + (dbg ? '|' + dbg : ''));
-  if (!g.groups.size) { grabEnd(g, why); return; }
-  reanchor(g);
 }
 
 function grabEnd(g, why) {
@@ -873,30 +805,65 @@ function grabStep() {
           continue;
         }
       }
+      // SLIP: рука ушла от предмета, а предмет не донёсся (упёрся в поводок, в другую фигуру
+      // или в предел скорости). APERTURE и CURL на это смотреть не могут: они про кисть.
+      const gap = gripGap(g, side);
+      if (gap !== null) {
+        if (gap > GRAB_SLIP) {
+          grp.slip++;
+          if (grp.slip >= GRAB_SLIP_FRAMES) {
+            groupLeave(g, side, 'slip', 'sl' + Math.round(gap * 1000) + 'мм/' + grp.slip);
+            continue;
+          }
+        } else grp.slip = 0;
+      }
     }
-    if (!grabs.has(g.id) || !g.p0) continue;         // последняя конечность разжалась
-    const cur = gripPoints(g);
-    if (!cur.n || cur.w <= 0) continue;
-    // Состав живых шаров изменился (пропал отслеживаемый сустав) — кадр заново: подгонка по
-    // разному набору точек считать не должна.
-    if (cur.n !== g.pts0.length) { reanchor(g); continue; }
-    const fitOk = fitGrip(g, cur);                   // вырождено — qFit остаётся прежним
-    g.resid = fitOk ? gripResidual(g, cur) : 0;
+    if (!grabs.has(g.id)) continue;                  // конечностей не осталось, захват окончен
+    if (!g.groups.size) { grabEnd(g, 'open'); continue; }
+    const b = bodies.get(g.id), p = posOf(b), qj = bi.GetRotation(b);
+    anQ.set(qj.GetX(), qj.GetY(), qj.GetZ(), qj.GetW());
+    const m = gripMatch(g, p, anQ);
+    if (!m) continue;                                // живых шаров не осталось
+    // ПОВОРОТ. То, что средний перенос не объясняет, объясняется поворотом вокруг центра
+    // якорей: малый угол методом наименьших квадратов. У направления, которого шары захвата не
+    // видят (закручивание вокруг оси пары), числитель нулевой — предмет по нему не крутится.
+    // Именно здесь куб, взятый одной рукой (2-5 шаров на одной грани), у прежнего Kabsch
+    // отбрасывался целиком как «вырожденная конфигурация» и только ехал за центром шаров,
+    // тогда как бублик — крутился (пальцы обхватывают трубу, конфигурация объёмная).
+    let nx = 0, ny = 0, nz = 0, den = 0, rs = 0, rw = 0;
+    for (let i = 0; i < m.n; i++) {
+      const o = i * 3, w = anW[i];
+      const ax = anR[o] - m.rx, ay = anR[o + 1] - m.ry, az = anR[o + 2] - m.rz;
+      const bx = anD[o] - m.dx, by = anD[o + 1] - m.dy, bz = anD[o + 2] - m.dz;
+      nx += w * (ay * bz - az * by); ny += w * (az * bx - ax * bz); nz += w * (ax * by - ay * bx);
+      den += w * (ax * ax + ay * ay + az * az);
+    }
+    const tx = den > 1e-9 ? nx / den : 0, ty = den > 1e-9 ? ny / den : 0,
+      tz = den > 1e-9 ? nz / den : 0;
+    // НЕВЯЗКА: остаток после переноса и поворота — то, что ни одним жёстким движением не
+    // объясняется. Это и есть «держатели перестали быть одной хваткой» (разъезд двух рук).
+    for (let i = 0; i < m.n; i++) {
+      const o = i * 3, w = anW[i];
+      const ax = anR[o] - m.rx, ay = anR[o + 1] - m.ry, az = anR[o + 2] - m.rz;
+      const bx = anD[o] - m.dx, by = anD[o + 1] - m.dy, bz = anD[o + 2] - m.dz;
+      const ex = bx - (ty * az - tz * ay), ey = by - (tz * ax - tx * az),
+        ez = bz - (tx * ay - ty * ax);
+      rs += w * (ex * ex + ey * ey + ez * ez); rw += w;
+    }
+    g.resid = rw > 0 ? Math.sqrt(rs / rw) : 0;
     // РАЗЪЕЗД ДЕРЖАТЕЛЕЙ. Пока предмет держат две конечности, разъезд ничем не измеряется:
     // у каждой руки свои aperture и curl, а ладонь сама по себе не меняется, когда ЕЁ уносят
     // от другой ладони. Живой замер: куб в двух ладонях, руки разъехались — Gc8RL продержался
-    // 22 с, m опустилось лишь до 11 мм. Заодно это ломает и кадр захвата: подгонка по двум
+    // 22 с, m опустилось лишь до 11 мм. Заодно это ломает и кадр: подгонка по двум
     // разъехавшимся кластерам не имеет жёсткого решения, поэтому предмет начинает вращаться
-    // на пустом месте. Порог — невязка подгонки: при жёстком переносе она нулевая.
+    // на пустом месте. Порог — невязка кадра: при жёстком переносе она нулевая.
     if (g.groups.size >= 2 && g.resid > GRAB_FIT) {
       const dbg = 'st' + Math.round(g.resid * 1000) + 'мм';
       for (const side of sidesOf(g)) if (g.groups.has(side)) groupLeave(g, side, 'spread', dbg);
+      grabEnd(g, 'spread');
       continue;
     }
-    const arm = new THREE.Vector3(g.p0.x - g.c0.x, g.p0.y - g.c0.y, g.p0.z - g.c0.z)
-      .applyQuaternion(g.qFit);
-    let tp = { x: cur.cx + arm.x, y: cur.cy + arm.y, z: cur.cz + arm.z };
-    const TQ = g.qFit.clone().multiply(new THREE.Quaternion(g.q0.x, g.q0.y, g.q0.z, g.q0.w));
+    let tp = { x: p.x + m.dx, y: p.y + m.dy, z: p.z + m.dz };
     // поводок: рука не уносит фигуру дальше leashMeters от точки захвата
     const an = anchors.get(g.id);
     const ddx0 = tp.x - an.x, ddy0 = tp.y - an.y, ddz0 = tp.z - an.z;
@@ -905,11 +872,10 @@ function grabStep() {
       const k = leashMeters / da;
       tp = { x: an.x + ddx0 * k, y: an.y + ddy0 * k, z: an.z + ddz0 * k };
     }
-    const b = bodies.get(g.id), p = posOf(b), q = bi.GetRotation(b);
     const ddx = tp.x - p.x, ddy = tp.y - p.y, ddz = tp.z - p.z;
     if (Math.hypot(ddx, ddy, ddz) > GRAB_TELEPORT) {   // телепорт, как у пальцев: иначе 200 м/с
       bi.SetPositionAndRotation(b, V(tp.x, tp.y, tp.z),
-        new Jolt.Quat(TQ.x, TQ.y, TQ.z, TQ.w), Jolt.EActivate_Activate);
+        new Jolt.Quat(qj.GetX(), qj.GetY(), qj.GetZ(), qj.GetW()), Jolt.EActivate_Activate);
       bi.SetLinearVelocity(b, V(0, 0, 0)); bi.SetAngularVelocity(b, V(0, 0, 0));
       g.lin = [0, 0, 0]; g.ang = [0, 0, 0];
       continue;
@@ -921,13 +887,10 @@ function grabStep() {
     const s2 = Math.hypot(vx, vy, vz);
     if (s2 > MAX_SPEED) { const k = MAX_SPEED / s2; vx *= k; vy *= k; vz *= k; }
     bi.SetLinearVelocity(b, V(vx, vy, vz));
-    const dq = new THREE.Quaternion(TQ.x, TQ.y, TQ.z, TQ.w)
-      .multiply(new THREE.Quaternion(q.GetX(), q.GetY(), q.GetZ(), q.GetW()).invert());
-    if (dq.w < 0) { dq.x = -dq.x; dq.y = -dq.y; dq.z = -dq.z; dq.w = -dq.w; }
-    const ang = 2 * Math.acos(Math.min(1, dq.w));
-    const sn = Math.sqrt(Math.max(1e-9, 1 - dq.w * dq.w));
-    let wx = dq.x / sn * ang * GRAB_FOLLOW / DT, wy = dq.y / sn * ang * GRAB_FOLLOW / DT,
-      wz = dq.z / sn * ang * GRAB_FOLLOW / DT;
+    // Угол кадра мал по построению (это рассогласование за один шаг), поэтому ось/угол разбирать
+    // не нужно: вектор малого поворота напрямую становится угловой скоростью, а направление,
+    // которого шары захвата не видят, остаётся нулевым само — его не надо запрещать веткой.
+    let wx = tx * GRAB_FOLLOW / DT, wy = ty * GRAB_FOLLOW / DT, wz = tz * GRAB_FOLLOW / DT;
     const sw = Math.hypot(wx, wy, wz);
     if (sw > MAX_SPIN) { const k = MAX_SPIN / sw; wx *= k; wy *= k; wz *= k; }
     bi.SetAngularVelocity(b, V(wx, wy, wz));
@@ -959,16 +922,18 @@ function grabDetect() {
 }
 
 /* Состояние захвата для HUD, луча и тестов: одна запись на фигуру, внутри — разбивка по
- * конечностям (s0 — левая, s1 — правая) и обе меры раскрытия, по которым судится отпускание. */
+ * конечностям (s0 — левая, s1 — правая) и все меры, по которым судится отпускание: размах
+ * (ap/curl), потеря (lost), уход от предмета (gap) и невязка кадра (resid). */
 function grabState() {
   return [...grabs.values()].map((g) => {
     const slots = allSlots(g).slice().sort((a, b) => a - b);
-    const out = { id: g.id, sides: sidesOf(g), slots, fit: g.pts0.length >= 3 };
+    const out = { id: g.id, sides: sidesOf(g), slots, anch: g.anch.size };
     for (const [side, grp] of g.groups) {
-      const ap = aperture(grp.slots), cu = handCurl(side);
+      const ap = aperture(grp.slots), cu = handCurl(side), gap = gripGap(g, side);
       out['s' + side] = { slots: grp.slots.slice(), ap: +ap.ap.toFixed(4),
         apMin: +grp.apMin.toFixed(4), curl: +cu.curl.toFixed(4),
-        curlMin: grp.curlMin === null ? null : +grp.curlMin.toFixed(4), lost: grp.lost };
+        curlMin: grp.curlMin === null ? null : +grp.curlMin.toFixed(4), lost: grp.lost,
+        gap: gap === null ? null : +gap.toFixed(4), slip: grp.slip };
     }
     const ap = aperture(slots);
     out.ap = +ap.ap.toFixed(4);
@@ -978,16 +943,18 @@ function grabState() {
   });
 }
 
-/* Запас до отпускания в миллиметрах: по какой мере захват ближе всего к расцеплению. Отрицатель
- * не бывает — как только мера переполняется, конечность уходит. */
+/* Запас до отпускания в миллиметрах: по какой мере захват ближе всего к расцеплению. Отрицательным
+ * не бывает — как только мера переполняется, конечность уходит. 9999 значит «мерить нечем»: кисть
+ * не видна, и ни одна из кистевых мер не считается (единственный выход — счётчик потери). */
 function releaseMargin(g) {
   let m = 9999;
   for (const [side, grp] of g.groups) {
-    const ap = aperture(grp.slots), cu = handCurl(side);
+    const ap = aperture(grp.slots), cu = handCurl(side), gap = gripGap(g, side);
     if (ap.live >= GRAB_MIN_JOINTS && grp.apMin > 0) {
       m = Math.min(m, (grp.apMin + GRAB_OPEN - ap.ap) * 1000);
     }
     if (cu.n >= 2 && grp.curlMin !== null) m = Math.min(m, (grp.curlMin + GRAB_OPEN - cu.curl) * 1000);
+    if (gap !== null) m = Math.min(m, (GRAB_SLIP - gap) * 1000);
   }
   if (g.groups.size >= 2) m = Math.min(m, (GRAB_FIT - (g.resid || 0)) * 1000);
   return Math.round(m);
@@ -1236,11 +1203,29 @@ function syncThree() {
     setInstance(i, p.x, p.y, p.z, slotR[i] + HAND_PAD * 0.5);
   }
   handMesh.instanceMatrix.needsUpdate = true;
-  for (let i = 0; i < touchMeshes.length; i++) {
-    const c = frameContacts[i];
-    touchMeshes[i].visible = !!c;
-    if (c) touchMeshes[i].position.set(c.x, c.y, c.z);
+  let ti = 0;
+  for (; ti < touchMeshes.length && ti < frameContacts.length; ti++) {
+    const c = frameContacts[ti];
+    touchMeshes[ti].visible = true;
+    touchMeshes[ti].position.set(c.x, c.y, c.z);
   }
+  // Держащая конечность выпадает из коллизий с предметом, поэтому МАНИФОЛДОВ у неё нет вовсе,
+  // и на живом заходе это читалось как «захват не работает: красных точек касания нет». Точки
+  // держателей дорисовываем геометрически — по ближайшей точке поверхности той же формы, по
+  // которой считаются slip и вход второй руки.
+  gripDots = 0;
+  for (const g of grabs.values()) {
+    for (const s of allSlots(g)) {
+      if (ti >= touchMeshes.length) break;
+      const t = targets[s];
+      if (!t.live) continue;
+      const si = surfaceInfo(g.id, t.x, t.y, t.z);
+      touchMeshes[ti].visible = true;
+      touchMeshes[ti].position.set(t.x - si.nx * si.gap, t.y - si.ny * si.gap, t.z - si.nz * si.gap);
+      ti++; gripDots++;
+    }
+  }
+  for (; ti < touchMeshes.length; ti++) touchMeshes[ti].visible = false;
 }
 
 /* ------------------------------------------------------- отладочный луч */
@@ -1478,6 +1463,7 @@ window.__ja = {
     if (o.proxy !== undefined) showHands = !!o.proxy;
     if (o.open !== undefined) GRAB_OPEN = o.open;
     if (o.fit !== undefined) GRAB_FIT = o.fit;
+    if (o.slip !== undefined) GRAB_SLIP = o.slip;
     if (o.grab !== undefined) {
       grabOn = !!o.grab;
       if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'cfg');
@@ -1571,6 +1557,10 @@ window.__ja = {
   report: () => fullReport(),
   sent: () => sent,
   touchDots() { return touchMeshes.filter((m) => m.visible).length; },
+  // Сколько маркеров в кадре нарисованы как ДЕРЖАТЕЛИ (у держащей конечности манифолдов нет
+  // вовсе — её шары исключены из коллизий с предметом, и без этих точек захват выглядит
+  // невидимым).
+  grabDots() { syncThree(); return gripDots; },
   diag() {
     return { calls: renderer.info.render.calls, tris: renderer.info.render.triangles, frames: frames,
       presenting: renderer.xr.isPresenting, errs: consoleErrs,
