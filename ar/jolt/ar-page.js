@@ -366,6 +366,15 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  *     ≈ 160-190 мм. Работает и когда в захвате один шар (у щепотки размах оценить нечем).
  * Ни одна из них не измеряет расстояние до предмета: предмет едет за кистью, поэтому по нему
  * раскрывание ладони невидимо вовсе.
+ *   SPREAD — третья мера, и у неё другой предмет: РАЗЪЕЗД ДВУХ ДЕРЖАЩИХ РУК. Когда предмет
+ * держат две конечности, ни aperture, ни curl разъезд не замечают: ладонь сама по себе остаётся
+ * ладонью, её размах и сгиб не меняются, пока кисть не менялась. Живой замер 2026-11-05:
+ * `grab|cube|8|R,L`, 22 с `Gc8RL(m45→11)` и ни одного отпускания, пока левая кисть не пропала
+ * из трекинга (leave|cube|L|lost). Заодно ломается и кадр захвата: Kabsch по восьми сферах двух
+ * разъехавшихся кистей подгоняет несуществующую жёсткую конфигурацию, поэтому предмет начинает
+ * вращаться на пустом месте. Меряется расстояние между центрами шаров держящих конечностей:
+ * вырос больше GRAB_SPREAD относительно самого сжатого кадра — хватка рвётся, предмет отпускают
+ * обе руки. При одной держящей конечности мера не работает вовсе (предмет и так едет за ней).
  */
 const GRAB_MIN_JOINTS = 2;       // минимум разных суставов, чтобы держать
 const GRAB_FRAMES = 3;           // сколько кадров подряд условие держится до включения
@@ -386,6 +395,10 @@ let GRAB_FOLLOW = isFinite(+QS.get('follow')) && +QS.get('follow') > 0 ?
   Math.min(1, +QS.get('follow')) : 0.6;
 const GRAB_TELEPORT = 0.25;      // м: крупный разрыв уходит в телепорт, как у пальцев
 const GRAB_JOINT_REACH = 0.25;   // м: дальше этого сустав не «палец этой кисти» (в тестах кисти убраны)
+/* Насколько державшие шары могут перестать напоминать одно жёсткое целое (RMS невязки
+ * подгонки, метры). Смысл — хватка рвётся, когда две руки разъезжаются: предмет нельзя держать
+ * ладонями в полуметре друг от друга. Правится на ходу: ?fit=80 (миллиметры). */
+let GRAB_FIT = isFinite(+QS.get('fit')) && +QS.get('fit') > 0 ? +QS.get('fit') / 1000 : 0.06;
 const GRAB_GRACE = 1.0;          // с: ещё столько снятая конечность не трогает выпущенную фигуру
 const FIT_RANK = 0.1;            // σ3/σ2 ниже — конфигурация вырождена, поворот не берём
 let grabOn = QS.get('grab') !== '0';
@@ -734,6 +747,28 @@ function fitGrip(g, cur) {
   return true;
 }
 
+/* Невязка подгонки, метры: RMS расстояния между текущими шарами захвата и конфигурацией момента
+ * взятия, повёрнутой на qFit. При жёстком переносе и повороте кистей она равна нулю по
+ * построению, а растёт только когда державшие шары разошлись НЕ как одно целое — то есть когда
+ * хватки фактически уже нет. Именно этого не видят aperture и curl: у каждой руки свои счётчики,
+ * а разъезд ДВУХ рук не меняет ни размах, ни сгиб каждой по отдельности (живой замер: куб в двух
+ * ладонях, руки разъехались — 22 с в захвате, m упало только до 11 мм).
+ * Считается только для успешной подгонки: при вырожденной конфигурации qFit остаётся прежним,
+ * и невязка по нему — не про реальность. */
+const rvA = new THREE.Vector3();
+function gripResidual(g, cur) {
+  const A = g.pts0, B = cur.pts;
+  if (A.length < 3 || B.length !== A.length) return 0;
+  let s = 0, w = 0;
+  for (let i = 0; i < A.length; i++) {
+    rvA.set(A[i].x - g.c0.x, A[i].y - g.c0.y, A[i].z - g.c0.z).applyQuaternion(g.qFit);
+    const dx = rvA.x - (B[i].x - cur.cx), dy = rvA.y - (B[i].y - cur.cy), dz = rvA.z - (B[i].z - cur.cz);
+    s += A[i].w * (dx * dx + dy * dy + dz * dz);
+    w += A[i].w;
+  }
+  return w > 0 ? Math.sqrt(s / w) : 0;
+}
+
 function addGroup(g, side, slots) {
   const ap = aperture(slots), cu = handCurl(side);
   g.groups.set(side, { slots: slots.slice(), apMin: ap.ap, curlMin: cu.n >= 2 ? cu.curl : null,
@@ -750,7 +785,7 @@ function addGrace(fig, side) {
 
 function grabStart(c) {
   const g = { id: c.fig, groups: new Map(), pts0: [], c0: null, p0: null, q0: null,
-    qFit: new THREE.Quaternion(), lin: null, ang: null };
+    qFit: new THREE.Quaternion(), lin: null, ang: null, resid: 0 };
   const bySide = new Map();
   for (const s of c.slots) {
     const side = handOfSlot(s);
@@ -845,7 +880,19 @@ function grabStep() {
     // Состав живых шаров изменился (пропал отслеживаемый сустав) — кадр заново: подгонка по
     // разному набору точек считать не должна.
     if (cur.n !== g.pts0.length) { reanchor(g); continue; }
-    fitGrip(g, cur);                                 // вырождено — qFit остаётся прежним
+    const fitOk = fitGrip(g, cur);                   // вырождено — qFit остаётся прежним
+    g.resid = fitOk ? gripResidual(g, cur) : 0;
+    // РАЗЪЕЗД ДЕРЖАТЕЛЕЙ. Пока предмет держат две конечности, разъезд ничем не измеряется:
+    // у каждой руки свои aperture и curl, а ладонь сама по себе не меняется, когда ЕЁ уносят
+    // от другой ладони. Живой замер: куб в двух ладонях, руки разъехались — Gc8RL продержался
+    // 22 с, m опустилось лишь до 11 мм. Заодно это ломает и кадр захвата: подгонка по двум
+    // разъехавшимся кластерам не имеет жёсткого решения, поэтому предмет начинает вращаться
+    // на пустом месте. Порог — невязка подгонки: при жёстком переносе она нулевая.
+    if (g.groups.size >= 2 && g.resid > GRAB_FIT) {
+      const dbg = 'st' + Math.round(g.resid * 1000) + 'мм';
+      for (const side of sidesOf(g)) if (g.groups.has(side)) groupLeave(g, side, 'spread', dbg);
+      continue;
+    }
     const arm = new THREE.Vector3(g.p0.x - g.c0.x, g.p0.y - g.c0.y, g.p0.z - g.c0.z)
       .applyQuaternion(g.qFit);
     let tp = { x: cur.cx + arm.x, y: cur.cy + arm.y, z: cur.cz + arm.z };
@@ -926,6 +973,7 @@ function grabState() {
     const ap = aperture(slots);
     out.ap = +ap.ap.toFixed(4);
     out.apMin = Math.min(...[...g.groups.values()].map((gr) => +gr.apMin.toFixed(4)));
+    out.resid = +(g.resid || 0).toFixed(4);
     return out;
   });
 }
@@ -941,6 +989,7 @@ function releaseMargin(g) {
     }
     if (cu.n >= 2 && grp.curlMin !== null) m = Math.min(m, (grp.curlMin + GRAB_OPEN - cu.curl) * 1000);
   }
+  if (g.groups.size >= 2) m = Math.min(m, (GRAB_FIT - (g.resid || 0)) * 1000);
   return Math.round(m);
 }
 
@@ -1428,6 +1477,7 @@ window.__ja = {
     if (o.hands !== undefined) handsMode = o.hands === 'index' ? 'index' : 'full';
     if (o.proxy !== undefined) showHands = !!o.proxy;
     if (o.open !== undefined) GRAB_OPEN = o.open;
+    if (o.fit !== undefined) GRAB_FIT = o.fit;
     if (o.grab !== undefined) {
       grabOn = !!o.grab;
       if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'cfg');
