@@ -191,9 +191,14 @@ async function boot() {
   bi = ps.GetBodyInterfaceNoLock();
   ps.SetGravity(V(0, 0, 0));               // гравитации нет: фигуры стоят там, где поставили
   setSpeculative(ps, HAND_PAD);
-  frameContacts = contactRecorder(Jolt, alive, ps);
+  frameContacts = contactRecorder(Jolt, alive, ps, pairIgnored);
 
   for (const f of FIGS) {
+    // Аналитическое описание той же формы: по нему судим, где шар руки относительно фигуры
+    // (у держимой фигуры контактов нет вовсе — она кинематик).
+    shapeDesc.set(f.id, f.id === 'sphere' ? { kind: 'sphere', r: f.r }
+      : f.id === 'cube' ? { kind: 'box', half: f.half }
+        : { kind: 'torus', R: f.R, tube: f.tube });
     const id = addBody(Jolt, bi, bodySettings(Jolt, shapeFor(Jolt, f), 0, 0, 0,
       Jolt.EMotionType_Dynamic, L_SHAPE,
       { linearDamping: DAMP, angularDamping: DAMP_A, friction: 0.5, restitution: 0 }));
@@ -316,23 +321,34 @@ function leash() {
 const driveBuf = new Float32Array(MAX_SLOTS * 4);
 
 /* ------------------------------------------------------------------ захват
- * Предмет держится, когда его с ДВУХ сторон толкают РАЗНЫЕ суставы одной кисти: направления
- * толкания (нормаль манifold`а: из сустава в точку контакта) противоположны. Это физика
- * процесса, а не жест: «вектора воздействий пересекаются».
+ * Предмет держат шары РАЗНЫХ групп руки с двух сторон: направления толкания (нормаль
+ * манifold`а: из сустава в точку контакта) противоположны. Это физика процесса, а не жест:
+ * «вектора воздействий пересекаются».
+ *
+ * ГРУППА — палец (thumb/index/middle/ring/pinky) или ладонь (wrist + пять metacarpal, они
+ * внутри ладони). Две сферы одной группы держать не могут: расстояние между ними не меняется,
+ * поэтому разжаться такой захват физически не способен — на этом вживую ломалось отпускание
+ * (зацепление между index-phalanx-proximal и index-tip расцепился только тряской руки). Ключ
+ * группы — сторона+группа, значит ладонь левой и ладонь правой РАЗНЫЕ группы: держать двумя
+ * руками можно, в том числе двумя ладонями.
  *
  * Как держим: фигура на время захвата становится КИНЕМАТИЧЕСКОЙ и едет за кадром захвата.
- * Проверено в node (ar/jolt/spike.mjs): кинематическое тело интегрирует и линейную, и
- * угловую скорость, а обратно в динамику возвращаться умеет. Следствие: во время захвата
- * контактов палец<->фигура нет вовсе (kinematic<->kinematic), поэтому отпускание судится
- * ГЕОМЕТРИЕЙ, а не контактами.
+ * Проверено в node (ar/jolt/spike.mjs): кинематик интегрирует и линейную, и угловую скорость и
+ * возвращается в динамику. Следствие: контактов палец<->фигура во время захвата нет вовсе
+ * (kinematic<->kinematic), поэтому отпускание и приход второй руки судятся ГЕОМЕТРИЕЙ.
  *
- * Кадр захвата: центр — средневзвешенный по радиусам центр державших суставов; ориентация —
- * по главному суставу (самый крупный радиус из державших), его матрица приходит прямо из
- * fillPoses. Смещение фигуры относительно кадра и её поворот относительно кадра запоминаются.
+ * КАДР ЗАХВАТА — жёсткая подгонка (Kabsch/Procrustes) по всем шарам захвата обеих рук: центр —
+ * средневзвешенный по радиусам центр всех державших шаров, поворот — тот, что лучше всего
+ * совмещает их текущую конфигурацию с конфигурацией момента захвата. Он определён только для
+ * ≥3 неколлинеарных шаров; иначе предмет только переезжает, но не крутится — раньше ориентацию
+ * брали с матрицы одного сустава ровно потому, что двух пальцев для поворота не хватает.
  *
- * Отпускаем, когда захват РАСКРЫЛСЯ: размах державших суставов вырос больше чем на GRAB_OPEN
- * относительно САМОГО СЖАТОГО кадра за время захвата. Пальцы стоят или сжимаются — держим.
- * Плюс: живых суставов меньше двух, рука пропала, захват выключен параметром.
+ * ОТПУСКАЕТ КОНЕЧНОСТЬ, а не весь захват: у каждой руки свой счётчик разжима (GRAB_OPEN от
+ * самого сжатого кадра) и свой счётчик потерянных кадров (GRAB_LOST). Вышедшая конечность
+ * перестаёт сталкиваться с фигурой ещё на GRAB_GRACE секунд — или пока её шары не выйдут из
+ * фигуры: иначе застрявшие внутри шары продолжают тащить предмет, и захват кажется
+ * бесконечным.
+ * Конечностей не осталось — захват окончен.
  */
 const GRAB_MIN_JOINTS = 2;       // минимум разных суставов, чтобы держать
 const GRAB_FRAMES = 3;           // сколько кадров подряд условие держится до включения
@@ -340,21 +356,58 @@ const GRAB_OPPOSE = -0.3;        // dot направлений толкания 
 const GRAB_OPEN = 0.03;          // м: насколько разжались пальцы относительно минимума — отпустить
 const GRAB_LOST = 30;            // кадров без двух живых суставов — отпустить
 const GRAB_MAX_SPAN = 0.20;      // м: размах больше этого — это не захват, а случайные касания
+const GRAB_GRACE = 1.0;          // с: ещё столько снятая конечность не трогает выпущенную фигуру
+const FIT_RANK = 0.1;            // σ3/σ2 ниже — конфигурация вырождена, поворот не берём
 let grabOn = QS.get('grab') !== '0';
-const grabs = new Map();         // side -> захват (на кисть не больше одного предмета)
-const grabbed = new Set();       // id фигур, которые сейчас держат
-const holdFrames = new Map();    // fig id -> сколько кадров подряд он зажаты (до включения)
+const grabs = new Map();         // fig id -> захват: одна фигура = один захват
+const grabbed = new Set();       // id фигур в захвате
+const holdFrames = new Map();    // "fig|стороны" -> кадров подряд под условием (до включения)
+const joinFrames = new Map();    // "fig|сторона" -> кадров подряд рука внутри держимой фигуры
+const grace = [];                // {fig, side, until}: игнор коллизий снятой конечности
+/* Шаг физики фиксированный (DT), поэтому окно прощения считается ШАГАМИ, а не часами: в
+ * headless-тесте виртуальное время внутри синхронного цикла не идёт вовсе (замерено), а в
+ * шлеме просадка кадров не должна съедать половину окна. */
+let simSteps = 0;
+const GRACE_STEPS = Math.round(GRAB_GRACE / DT);
 
 // Контакты приходят парами указателей, поэтому нужны ключи тел: key->слот и key->фигура.
 const keyToSlot = new Map(), keyToFig = new Map();
+const figKey = new Map();        // fig id -> ключ тела (пары игнора строятся по ключам)
+const slotKey = [];              // слот -> ключ тела сферы руки (обратная к keyToSlot)
 function indexContactKeys() {
-  keyToSlot.clear(); keyToFig.clear();
-  for (let i = 0; i < fingers.length; i++) keyToSlot.set(fingers[i].GetIndexAndSequenceNumber(), i);
-  for (let i = 0; i < bodyIds.length; i++) keyToFig.set(bodiesList[i].GetIndexAndSequenceNumber(), bodyIds[i]);
+  keyToSlot.clear(); keyToFig.clear(); figKey.clear(); slotKey.length = 0;
+  for (let i = 0; i < fingers.length; i++) {
+    const k = fingers[i].GetIndexAndSequenceNumber();
+    keyToSlot.set(k, i);
+    slotKey[i] = k;
+  }
+  for (let i = 0; i < bodyIds.length; i++) {
+    const k = bodiesList[i].GetIndexAndSequenceNumber();
+    keyToFig.set(k, bodyIds[i]);
+    figKey.set(bodyIds[i], k);
+  }
 }
 const handOfSlot = (s) => (s < HAND_SLOTS ? 0 : 1);      // контроллеры (50/51) не хватают
 
-/* Кандидаты на захват по контактам ПРЕДЫДУЩЕГО шага: фигура -> {сторона, слоты}. */
+/* Группа сустава по имени из спеки: палец или ладонь. Ключ — сторона+группа: «ладонь левой» и
+ * «ладонь правой» — разные группы, две сферы одной ладони — одна. */
+const JOINT_GROUP = JOINT_ORDER.map((n) =>
+  (n === 'wrist' || n.endsWith('-metacarpal')) ? 'palm' : n.split('-')[0]);
+const groupKey = (s) => (handOfSlot(s) ? 'R' : 'L') + ':' + JOINT_GROUP[s % HAND_SLOTS];
+const sidesOf = (g) => [...g.groups.keys()];
+function allSlots(g) {
+  let a = [];
+  for (const gr of g.groups.values()) a = a.concat(gr.slots);
+  return a;
+}
+const sideBusy = (side) => {          // рука уже держит другую фигуру -> её id
+  for (const g of grabs.values()) if (g.groups.has(side)) return g.id;
+  return null;
+};
+
+/* Кандидаты на захват по контактам ПРЕДЫДУЩЕГО шага: фигура -> стороны и слоты, которые её
+ * держат. Кандидат принимается, только если держат РАЗНЫЕ группы и хотя бы одна оппозитивная
+ * пара приходит из разных групп; все участвующие руки обязаны быть свободны. */
 function gripCandidates() {
   const byFig = new Map();
   for (const c of frameContacts) {
@@ -372,23 +425,57 @@ function gripCandidates() {
   const out = [];
   for (const [fig, m] of byFig) {
     if (grabbed.has(fig) || m.size < GRAB_MIN_JOINTS) continue;
-    let side = -1, same = true;
-    for (const s of m.keys()) {
-      const sd = handOfSlot(s);
-      if (side < 0) side = sd; else if (sd !== side) same = false;    // разными кистями не держим
-    }
-    if (!same || side < 0 || grabs.has(side)) continue;
-    const arr = [...m.entries()];
-    let opposed = false;
-    for (let i = 0; i < arr.length && !opposed; i++) {
-      for (let j = i + 1; j < arr.length; j++) {
-        const d = arr[i][1][0] * arr[j][1][0] + arr[i][1][1] * arr[j][1][1] + arr[i][1][2] * arr[j][1][2];
-        if (d < GRAB_OPPOSE) { opposed = true; break; }
-      }
-    }
-    if (opposed) out.push({ fig, side, slots: arr.map((e) => e[0]) });
+    const slots = gripSlotsOf([...m.entries()]);
+    if (!slots) continue;
+    const sides = [...new Set(slots.map((s) => handOfSlot(s)))];
+    if (sides.some((sd) => sideBusy(sd) !== null)) continue;   // рука уже что-то держит
+    out.push({ fig, sides, slots });
   }
   return out;
+}
+
+/* Вторая рука приходит ВНУТРЬ держимой фигуры: контактов с ней нет (оба тела кинематики),
+ * поэтому кандидатом считает геометрия — какие шары руки внутри формы и держат ли они с двух
+ * сторон. Направление толкания — из шара к ближайшей точке поверхности. */
+function joinCandidates() {
+  const out = [];
+  for (const g of grabs.values()) {
+    for (let side = 0; side < 2; side++) {
+      if (g.groups.has(side) || sideBusy(side) !== null) continue;
+      const entries = [];
+      for (let j = 0; j < HAND_SLOTS; j++) {
+        const s = side * HAND_SLOTS + j, t = targets[s];
+        if (!t.live) continue;
+        const si = surfaceInfo(g.id, t.x, t.y, t.z);
+        if (si.gap > slotR[s]) continue;                     // шар ещё снаружи формы
+        entries.push([s, [-si.nx, -si.ny, -si.nz]]);
+      }
+      const slots = gripSlotsOf(entries);
+      if (slots) out.push({ fig: g.id, side, slots });
+    }
+  }
+  return out;
+}
+
+/* Зацепление устанавливают шары из РАЗНЫХ групп: два шара одного пальца или одной ладони
+ * друг напротив друга не считаются (ключ группы один и тот же), а палец+ладонь, два разных
+ * пальца и любые шары разных рук — считаются (в ключе группы есть сторона кисти). Внутри
+ * захвата оказываются ВСЕ шары, которые сейчас трогают предмет: они им и управляют. */
+function gripSlotsOf(entries) {
+  let opposed = false;
+  for (let i = 0; i < entries.length && !opposed; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const si = entries[i][0], sj = entries[j][0];
+      if (groupKey(si) === groupKey(sj)) continue;           // один палец / одна ладонь
+      const di = entries[i][1], dj = entries[j][1];
+      if (di[0] * dj[0] + di[1] * dj[1] + di[2] * dj[2] > GRAB_OPPOSE) continue;
+      opposed = true;
+      break;
+    }
+  }
+  if (!opposed) return null;
+  const slots = [...new Set(entries.map((e) => e[0]))];
+  return slots.length >= GRAB_MIN_JOINTS ? slots : null;
 }
 
 function gripSpan(slots) {
@@ -404,47 +491,231 @@ function gripSpan(slots) {
   return { span: live ? Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) : 0, live };
 }
 
-const gC = new THREE.Vector3(), gM = new THREE.Matrix4(), gQ = new THREE.Quaternion();
-function gripFrame(g) {
-  let w = 0, live = 0;
-  gC.set(0, 0, 0);
-  for (const s of g.slots) {
-    const t = targets[s];
-    if (!t.live) continue;
-    gC.x += t.x * t.r; gC.y += t.y * t.r; gC.z += t.z * t.r; w += t.r; live++;
+/* ----------------------------------------------- геометрия формы фигуры
+ * Держимая фигура — кинематик, контактов с ней нет, а судить «шар внутри/снаружи» и стала ли
+ * вторая рука кандидатом надо по форме. Локальные оси совпадают с формой из jolt-setup.js:
+ * шар r, куб half по осям, кольцо — окружность радиуса R в плоскости XY (нормаль Z). */
+const shapeDesc = new Map();       // fig id -> {kind, r | half | R, tube}
+const vLoc = new THREE.Vector3(), vSurf = new THREE.Vector3(), vTmp = new THREE.Vector3();
+const vNrm = new THREE.Vector3(), qRot = new THREE.Quaternion(), qInv = new THREE.Quaternion();
+function surfaceInfo(fig, x, y, z) {
+  const d = shapeDesc.get(fig);
+  if (!d) return { gap: 1e9, nx: 0, ny: 0, nz: 1 };
+  const b = bodies.get(fig), p = posOf(b), q = bi.GetRotation(b);
+  qRot.set(q.GetX(), q.GetY(), q.GetZ(), q.GetW());
+  qInv.copy(qRot).invert();
+  const v = vLoc.set(x - p.x, y - p.y, z - p.z).applyQuaternion(qInv);
+  let gap;
+  if (d.kind === 'sphere') {
+    const L = v.length() || 1e-9;
+    vSurf.set(v.x / L * d.r, v.y / L * d.r, v.z / L * d.r);
+    gap = L - d.r;
+  } else if (d.kind === 'box') {
+    const h = d.half;
+    vSurf.set(Math.min(Math.max(v.x, -h), h), Math.min(Math.max(v.y, -h), h),
+      Math.min(Math.max(v.z, -h), h));
+    const ex = Math.abs(v.x) - h, ey = Math.abs(v.y) - h, ez = Math.abs(v.z) - h;
+    gap = vTmp.set(Math.max(ex, 0), Math.max(ey, 0), Math.max(ez, 0)).length() +
+      Math.min(Math.max(ex, Math.max(ey, ez)), 0);
+  } else {                                     // кольцо: окружность R в XY, труба tube
+    const rho = Math.hypot(v.x, v.y) || 1e-9;
+    vSurf.set(v.x / rho * d.R, v.y / rho * d.R, 0);
+    gap = Math.hypot(rho - d.R, v.z) - d.tube;
   }
-  if (!live || w <= 0) return null;
-  gC.divideScalar(w);
-  const refT = targets[g.ref] && targets[g.ref].live ? targets[g.ref]
-    : targets[g.slots.find((s) => targets[s].live)];
-  if (!refT) return null;
-  gQ.setFromRotationMatrix(gM.fromArray(refT.m));
-  return { cx: gC.x, cy: gC.y, cz: gC.z, qx: gQ.x, qy: gQ.y, qz: gQ.z, qw: gQ.w, live };
+  // нормаль — от поверхности к шару руки (наружу), в мировых осях
+  vNrm.set(v.x - vSurf.x, v.y - vSurf.y, v.z - vSurf.z);
+  if (vNrm.lengthSq() < 1e-18) vNrm.set(0, 0, 1);
+  vNrm.normalize().applyQuaternion(qRot);
+  return { gap, nx: vNrm.x, ny: vNrm.y, nz: vNrm.z };
 }
 
-function biggestSlot(slots) {
-  let best = slots[0], r = -1;
-  for (const s of slots) if (slotR[s] > r) { r = slotR[s]; best = s; }
-  return best;
+/* Живые шары захвата (шары всех конечностей) и их взвешенный по радиусам центр. */
+function gripPoints(g) {
+  const pts = [];
+  let w = 0, cx = 0, cy = 0, cz = 0;
+  for (const s of allSlots(g)) {
+    const t = targets[s];
+    if (!t.live) continue;
+    pts.push({ x: t.x, y: t.y, z: t.z, w: t.r });
+    cx += t.x * t.r; cy += t.y * t.r; cz += t.z * t.r; w += t.r;
+  }
+  if (w > 0) { cx /= w; cy /= w; cz /= w; }
+  return { pts, n: pts.length, cx, cy, cz, w };
+}
+
+/* Переснять кадр: конфигурация шаров и поза фигуры берутся «как сейчас». Нужно при взятии, при
+ * входе/выходе конечности и когда состав живых шаров изменился: иначе подгонка считает поворот
+ * от устаревшей конфигурации, и предмет подпрыгивает. */
+function reanchor(g) {
+  const cur = gripPoints(g);
+  if (!cur.n || cur.w <= 0) return false;
+  g.pts0 = cur.pts.map((p) => ({ x: p.x, y: p.y, z: p.z, w: p.w }));
+  g.c0 = { x: cur.cx, y: cur.cy, z: cur.cz };
+  const b = bodies.get(g.id), p = posOf(b), q = bi.GetRotation(b);
+  g.p0 = { x: p.x, y: p.y, z: p.z };
+  g.q0 = { x: q.GetX(), y: q.GetY(), z: q.GetZ(), w: q.GetW() };
+  g.qFit.set(0, 0, 0, 1);
+  return true;
+}
+
+/* Якобиана симметричной 3×3: A = V diag(lam) Vᵀ, столбцы V — собственные векторы. */
+function jacobi3(aIn) {
+  const a = aIn.slice();
+  const V = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  for (let sweep = 0; sweep < 24; sweep++) {
+    if (a[1] * a[1] + a[2] * a[2] + a[5] * a[5] < 1e-24) break;
+    for (let it = 0; it < 3; it++) {
+      const p = [0, 0, 1][it], q = [1, 2, 2][it];
+      const apq = a[p * 3 + q];
+      if (Math.abs(apq) < 1e-18) continue;
+      const th = (a[q * 3 + q] - a[p * 3 + p]) / (2 * apq);
+      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < 3; k++) {                       // A <- A·J (столбцы)
+        const x = a[k * 3 + p], y = a[k * 3 + q];
+        a[k * 3 + p] = c * x - s * y; a[k * 3 + q] = s * x + c * y;
+      }
+      for (let k = 0; k < 3; k++) {                       // A <- Jᵀ·A (строки)
+        const x = a[p * 3 + k], y = a[q * 3 + k];
+        a[p * 3 + k] = c * x - s * y; a[q * 3 + k] = s * x + c * y;
+      }
+      for (let k = 0; k < 3; k++) {                       // V <- V·J
+        const x = V[k * 3 + p], y = V[k * 3 + q];
+        V[k * 3 + p] = c * x - s * y; V[k * 3 + q] = s * x + c * y;
+      }
+    }
+  }
+  return { lam: [a[0], a[4], a[8]], V };
+}
+
+function mm3(a, b) {
+  const o = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let r = 0; r < 3; r++) {
+    o[r * 3] = a[r * 3] * b[0] + a[r * 3 + 1] * b[3] + a[r * 3 + 2] * b[6];
+    o[r * 3 + 1] = a[r * 3] * b[1] + a[r * 3 + 1] * b[4] + a[r * 3 + 2] * b[7];
+    o[r * 3 + 2] = a[r * 3] * b[2] + a[r * 3 + 1] * b[5] + a[r * 3 + 2] * b[8];
+  }
+  return o;
+}
+
+/* Kabsch: поворот R, минимизирующий Σ w·|R·(p0−c0) − (p−c)|². SVD 3×3 — через якобиану HᵀH.
+ * Хватает ранга 2: три шара всегда лежат в одной плоскости (относительно своего центра), и
+ * поворот вокруг нормали к ней определён; «закручивание» вне плоскости не определено никогда,
+ * поэтому третья колонка U добирается векторным произведением и детерминант фиксируется +1 —
+ * это минимальный поворот. Ранг 1 (два шара, всё на одной прямой) — поворота нет, только перенос. */
+const fitM = new THREE.Matrix4();
+function hv3(H, v) {
+  return [H[0] * v[0] + H[1] * v[1] + H[2] * v[2],
+    H[3] * v[0] + H[4] * v[1] + H[5] * v[2],
+    H[6] * v[0] + H[7] * v[1] + H[8] * v[2]];
+}
+function fitGrip(g, cur) {
+  const A = g.pts0, B = cur.pts;
+  if (A.length < 3 || B.length !== A.length) return false;
+  const H = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < A.length; i++) {
+    const w = A[i].w;
+    const ax = (A[i].x - g.c0.x) * w, ay = (A[i].y - g.c0.y) * w, az = (A[i].z - g.c0.z) * w;
+    const bx = B[i].x - cur.cx, by = B[i].y - cur.cy, bz = B[i].z - cur.cz;
+    H[0] += bx * ax; H[1] += bx * ay; H[2] += bx * az;
+    H[3] += by * ax; H[4] += by * ay; H[5] += by * az;
+    H[6] += bz * ax; H[7] += bz * ay; H[8] += bz * az;
+  }
+  const Bt = [
+    H[0] * H[0] + H[3] * H[3] + H[6] * H[6],
+    H[0] * H[1] + H[3] * H[4] + H[6] * H[7],
+    H[0] * H[2] + H[3] * H[5] + H[6] * H[8],
+    H[1] * H[0] + H[4] * H[3] + H[7] * H[6],
+    H[1] * H[1] + H[4] * H[4] + H[7] * H[7],
+    H[1] * H[2] + H[4] * H[5] + H[7] * H[8],
+    H[2] * H[0] + H[5] * H[3] + H[8] * H[6],
+    H[2] * H[1] + H[5] * H[4] + H[8] * H[7],
+    H[2] * H[2] + H[5] * H[5] + H[8] * H[8],
+  ];
+  const e = jacobi3(Bt);
+  const sig = e.lam.map((l) => Math.sqrt(Math.max(0, l)));
+  const ord = [0, 1, 2].sort((p, q) => sig[q] - sig[p]);
+  if (sig[ord[1]] < 1e-12 || sig[ord[1]] < FIT_RANK * sig[ord[0]]) return false;
+  const colV = (k) => [e.V[k], e.V[3 + k], e.V[6 + k]];
+  /* Колонки U берём из SVD пока σ определён; недобранную добираем векторным произведением.
+   * Для трёх шаров σ3 = 0 всегда (три точки относительно своего центра плоские), и именно
+   * эта замена превращает неопределённое «закручивание» в минимальный поворот. */
+  const u = [];
+  for (let i = 0; i < 3; i++) {
+    const k = ord[i], s = sig[k];
+    if (s < 1e-12) break;
+    u.push(hv3(H, colV(k)).map((x) => x / s));
+  }
+  if (u.length < 2 || sig[ord[1]] < FIT_RANK * sig[ord[0]]) return false;
+  if (u.length < 3) {
+    const c = [u[0][1] * u[1][2] - u[0][2] * u[1][1], u[0][2] * u[1][0] - u[0][0] * u[1][2],
+      u[0][0] * u[1][1] - u[0][1] * u[1][0]];
+    const l3 = Math.hypot(c[0], c[1], c[2]) || 1e-9;
+    u.push([c[0] / l3, c[1] / l3, c[2] / l3]);
+  }
+  const U = [u[0][0], u[1][0], u[2][0], u[0][1], u[1][1], u[2][1], u[0][2], u[1][2], u[2][2]];
+  // Vᵀ в том же порядке сингулярных троек, что и колонки U, иначе R перемешивает направления.
+  const vc = [colV(ord[0]), colV(ord[1]), colV(ord[2])];
+  const Vt = [vc[0][0], vc[0][1], vc[0][2], vc[1][0], vc[1][1], vc[1][2], vc[2][0], vc[2][1], vc[2][2]];
+  const UVt = mm3(U, Vt);
+  const det = UVt[0] * (UVt[4] * UVt[8] - UVt[5] * UVt[7]) -
+    UVt[1] * (UVt[3] * UVt[8] - UVt[5] * UVt[6]) +
+    UVt[2] * (UVt[3] * UVt[7] - UVt[4] * UVt[6]);
+  const R = mm3(mm3(U, [1, 0, 0, 0, 1, 0, 0, 0, det >= 0 ? 1 : -1]), Vt);
+  fitM.set(R[0], R[1], R[2], 0, R[3], R[4], R[5], 0, R[6], R[7], R[8], 0, 0, 0, 0, 1);
+  g.qFit.setFromRotationMatrix(fitM);
+  return true;
+}
+
+function addGroup(g, side, slots) {
+  g.groups.set(side, { slots: slots.slice(), spanMin: gripSpan(slots).span, lost: 0 });
+}
+
+/* Конечность перестаёт трогать фигуру: во время захвата — пока держит, после отпускания ещё
+ * GRAB_GRACE секунд или пока её шары не выйдут из фигуры (см. rebuildIgnore). */
+function addGrace(fig, side) {
+  const until = simSteps + GRACE_STEPS;
+  for (const e of grace) if (e.fig === fig && e.side === side) { e.until = until; return; }
+  grace.push({ fig, side, until });
 }
 
 function grabStart(c) {
-  const ref = biggestSlot(c.slots);
-  const fr0 = gripFrame({ slots: c.slots, ref });
-  if (!fr0) return;
-  const b = bodies.get(c.fig), p = posOf(b), q = bi.GetRotation(b);
-  const q0 = new THREE.Quaternion(q.GetX(), q.GetY(), q.GetZ(), q.GetW());
-  const Q0 = new THREE.Quaternion(fr0.qx, fr0.qy, fr0.qz, fr0.qw).invert();
-  const off = new THREE.Vector3(p.x - fr0.cx, p.y - fr0.cy, p.z - fr0.cz).applyQuaternion(Q0);
-  const rot0 = Q0.clone().multiply(q0);
-  // поводок на время захвата считается от точки захвата: иначе рука не донесла бы фигуру
-  anchors.set(c.fig, { x: p.x, y: p.y, z: p.z });
-  bi.SetMotionType(b, Jolt.EMotionType_Kinematic, Jolt.EActivate_Activate);
+  const g = { id: c.fig, groups: new Map(), pts0: [], c0: null, p0: null, q0: null,
+    qFit: new THREE.Quaternion(), lin: null, ang: null };
+  const bySide = new Map();
+  for (const s of c.slots) {
+    const side = handOfSlot(s);
+    if (!bySide.has(side)) bySide.set(side, []);
+    bySide.get(side).push(s);
+  }
+  for (const [side, slots] of bySide) addGroup(g, side, slots);
+  grabs.set(c.fig, g);
   grabbed.add(c.fig);
-  const g = { id: c.fig, side: c.side, slots: c.slots.slice(), ref,
-    off, rot0, spanMin: gripSpan(c.slots).span, lost: 0, lin: null, ang: null };
-  grabs.set(c.side, g);
-  beacon('grab|' + c.fig + '|' + g.slots.length);
+  // поводок на время захвата считается от точки захвата: иначе рука не донесла бы фигуру
+  anchors.set(c.fig, posOf(bodies.get(c.fig)));
+  bi.SetMotionType(bodies.get(c.fig), Jolt.EMotionType_Kinematic, Jolt.EActivate_Activate);
+  reanchor(g);
+  beacon('grab|' + c.fig + '|' + allSlots(g).length + '|' +
+    sidesOf(g).map((s) => (s ? 'R' : 'L')).join(','));
+}
+
+/* Вторая конечность вошла в идущий захват (держит ТОТ ЖЕ предмет): центр и поворот теперь
+ * считаются по шарам обеих рук. Сменился состав — кадр переснимается, иначе предмет дёрнется. */
+function grabJoin(c) {
+  const g = grabs.get(c.fig);
+  if (!g || g.groups.has(c.side)) return;
+  addGroup(g, c.side, c.slots);
+  reanchor(g);
+  beacon('join|' + c.fig + '|' + (c.side ? 'R' : 'L') + '|' + c.slots.length);
+}
+
+/* Одна конечность разжалась — предмет продолжают держать остальные. */
+function groupLeave(g, side, why) {
+  g.groups.delete(side);
+  addGrace(g.id, side);
+  beacon('leave|' + g.id + '|' + (side ? 'R' : 'L') + '|' + why);
+  if (!g.groups.size) { grabEnd(g, why); return; }
+  reanchor(g);
 }
 
 function grabEnd(g, why) {
@@ -455,28 +726,39 @@ function grabEnd(g, why) {
     bi.SetLinearVelocity(b, V(g.lin[0], g.lin[1], g.lin[2]));
     bi.SetAngularVelocity(b, V(g.ang[0], g.ang[1], g.ang[2]));
   }
-  grabbed.delete(g.id); grabs.delete(g.side); holdFrames.delete(g.id);
+  for (const side of sidesOf(g)) addGrace(g.id, side);
+  grabbed.delete(g.id); grabs.delete(g.id);
+  for (const k of [...holdFrames.keys()]) if (k.startsWith(g.id + '|')) holdFrames.delete(k);
+  for (const k of [...joinFrames.keys()]) if (k.startsWith(g.id + '|')) joinFrames.delete(k);
   beacon('release|' + g.id + '|' + why);
 }
 
-/* Один кадр захвата: отпустить/довести. Вызывается ВНУТРИ шага, до ji.Step: кинематика
- * сама интегрирует скорость за шаг, как и пальцы. */
+/* Один кадр захвата: release конечностей и ведение фигуры. Вызывается ВНУТРИ шага, до ji.Step:
+ * кинематика сама интегрирует скорость за шаг, как и пальцы. */
 function grabStep() {
   for (const [, g] of [...grabs]) {
-    const sp = gripSpan(g.slots);
-    if (sp.live >= GRAB_MIN_JOINTS && sp.span < g.spanMin) g.spanMin = sp.span;
-    if (sp.live < GRAB_MIN_JOINTS) {
-      if (++g.lost > GRAB_LOST) { grabEnd(g, 'lost'); continue; }
-    } else g.lost = 0;
-    if (sp.span > g.spanMin + GRAB_OPEN || sp.span > GRAB_MAX_SPAN + GRAB_OPEN) {
-      grabEnd(g, 'open'); continue;
+    for (const [side, grp] of [...g.groups]) {
+      if (!g.groups.has(side)) continue;             // разжатая конечность уже убрана
+      const sp = gripSpan(grp.slots);
+      if (sp.live >= GRAB_MIN_JOINTS && sp.span < grp.spanMin) grp.spanMin = sp.span;
+      if (sp.live < GRAB_MIN_JOINTS) {
+        if (++grp.lost > GRAB_LOST) { groupLeave(g, side, 'lost'); continue; }
+      } else grp.lost = 0;
+      if (sp.span > grp.spanMin + GRAB_OPEN || sp.span > GRAB_MAX_SPAN + GRAB_OPEN) {
+        groupLeave(g, side, 'open'); continue;
+      }
     }
-    const fr = gripFrame(g);
-    if (!fr) continue;
-    const Q = new THREE.Quaternion(fr.qx, fr.qy, fr.qz, fr.qw);
-    let tp = g.off.clone().applyQuaternion(Q);
-    tp = { x: fr.cx + tp.x, y: fr.cy + tp.y, z: fr.cz + tp.z };
-    const TQ = Q.clone().multiply(g.rot0);
+    if (!grabs.has(g.id) || !g.p0) continue;         // последняя конечность разжалась
+    const cur = gripPoints(g);
+    if (!cur.n || cur.w <= 0) continue;
+    // Состав живых шаров изменился (пропал отслеживаемый сустав) — кадр заново: подгонка по
+    // разному набору точек считать не должна.
+    if (cur.n !== g.pts0.length) { reanchor(g); continue; }
+    fitGrip(g, cur);                                 // вырождено — qFit остаётся прежним
+    const arm = new THREE.Vector3(g.p0.x - g.c0.x, g.p0.y - g.c0.y, g.p0.z - g.c0.z)
+      .applyQuaternion(g.qFit);
+    let tp = { x: cur.cx + arm.x, y: cur.cy + arm.y, z: cur.cz + arm.z };
+    const TQ = g.qFit.clone().multiply(new THREE.Quaternion(g.q0.x, g.q0.y, g.q0.z, g.q0.w));
     // поводок: рука не уносит фигуру дальше leashMeters от точки захвата
     const an = anchors.get(g.id);
     const ddx0 = tp.x - an.x, ddy0 = tp.y - an.y, ddz0 = tp.z - an.z;
@@ -511,29 +793,83 @@ function grabStep() {
   }
 }
 
-/* Кандидаты в захват: контакты ПРЕДЫДУЩЕГО шага (их ещё не очистили). Счётчик подряд идущих
- * кадров нужен, чтобы случайное двойное касание не включало захват. */
+/* Кандидаты в захват: контакты ПРЕДЫДУЩЕГО шага (их ещё не очистили) + геометрия для второй
+ * руки, которая лезет в уже держимый предмет. Счётчик подряд идущих кадров нужен, чтобы
+ * случайное двойное касание не включало захват. */
 function grabDetect() {
-  const seen = new Set();
+  const seen = new Set(), seenJoin = new Set();
   for (const c of gripCandidates()) {
-    seen.add(c.fig);
-    const n = (holdFrames.get(c.fig) || 0) + 1;
-    holdFrames.set(c.fig, n);
-    if (n >= GRAB_FRAMES && !grabs.has(c.side)) grabStart(c);
+    const key = c.fig + '|' + c.sides.slice().sort().join(',');
+    seen.add(key);
+    const n = (holdFrames.get(key) || 0) + 1;
+    holdFrames.set(key, n);
+    if (n >= GRAB_FRAMES) grabStart(c);
   }
-  for (const id of [...holdFrames.keys()]) {
-    if (!seen.has(id) && !grabbed.has(id)) holdFrames.delete(id);
+  for (const c of joinCandidates()) {
+    const key = c.fig + '|' + c.side;
+    seenJoin.add(key);
+    const n = (joinFrames.get(key) || 0) + 1;
+    joinFrames.set(key, n);
+    if (n >= GRAB_FRAMES) grabJoin(c);
   }
+  for (const k of [...holdFrames.keys()]) if (!seen.has(k)) holdFrames.delete(k);
+  for (const k of [...joinFrames.keys()]) if (!seenJoin.has(k)) joinFrames.delete(k);
 }
 
-/* Состояние захвата для HUD, луча и тестов. */
+/* Состояние захвата для HUD, луча и тестов: одна запись на фигуру, внутри — разбивка по
+ * конечностям (s0 — левая, s1 — правая). */
 function grabState() {
   return [...grabs.values()].map((g) => {
-    const sp = gripSpan(g.slots);
-    return { id: g.id, side: g.side, slots: g.slots.slice(), ref: g.ref,
-      span: +sp.span.toFixed(4), spanMin: +g.spanMin.toFixed(4), lost: g.lost };
+    const slots = allSlots(g).slice().sort((a, b) => a - b);
+    const out = { id: g.id, sides: sidesOf(g), slots, fit: g.pts0.length >= 3 };
+    for (const [side, grp] of g.groups) {
+      const sp = gripSpan(grp.slots);
+      out['s' + side] = { slots: grp.slots.slice(), span: +sp.span.toFixed(4),
+        spanMin: +grp.spanMin.toFixed(4), lost: grp.lost };
+    }
+    const sp = gripSpan(slots);
+    out.span = +sp.span.toFixed(4);
+    out.spanMin = Math.min(...[...g.groups.values()].map((gr) => +gr.spanMin.toFixed(4)));
+    return out;
   });
 }
+
+/* Пары «фигура <-> сфера руки», которые narrowphase обязана пропустить. Не сталкиваются шары
+ * ТОЙ КОНЕЧНОСТИ, которая держит фигуру; остальные конечности сталкиваются как обычно: правая
+ * рука толкает предмет, который держит левая, и наоборот. После отпускания то же правило живёт
+ * GRAB_GRACE секунд — или пока шары конечности не выйдут из фигуры (иначе застрявшие внутри
+ * шары продолжают тащить предмет, и захват кажется бесконечным). */
+const ignoreSet = new Set();
+const pk = (a, b) => a * 16777216 + b;      // ключи embind < 2^24; заводим оба порядка
+function limbTouches(fig, side) {
+  for (let j = 0; j < HAND_SLOTS; j++) {
+    const s = side * HAND_SLOTS + j, t = targets[s];
+    if (t.live && surfaceInfo(fig, t.x, t.y, t.z).gap <= slotR[s]) return true;
+  }
+  return false;
+}
+function rebuildIgnore() {
+  ignoreSet.clear();
+  for (let i = grace.length - 1; i >= 0; i--) {
+    if (grace[i].until < simSteps || !limbTouches(grace[i].fig, grace[i].side)) grace.splice(i, 1);
+  }
+  if (!grabs.size && !grace.length) return;
+  const addPairs = (fig, side) => {
+    const fk = figKey.get(fig);
+    if (fk === undefined) return;
+    for (let j = 0; j < HAND_SLOTS; j++) {
+      const sk = slotKey[side * HAND_SLOTS + j];
+      if (sk === undefined) continue;
+      ignoreSet.add(pk(fk, sk));
+      ignoreSet.add(pk(sk, fk));
+    }
+  };
+  for (const g of grabs.values()) for (const side of sidesOf(g)) addPairs(g.id, side);
+  for (const e of grace) addPairs(e.fig, e.side);
+}
+/* Предикат для contactRecorder. Ключи тел снимаются только когда игнор реально есть: на пустом
+ * Set два лишних wasm-вызова на каждый контакт не нужны. */
+const pairIgnored = (a, b, keyOf) => ignoreSet.size > 0 && ignoreSet.has(pk(keyOf(a), keyOf(b)));
 
 function fromTargets(buf) {
   for (let i = 0; i < MAX_SLOTS; i++) {
@@ -560,8 +896,10 @@ function stepPhysics(n, fill) {
       }
     }
     if (grabOn) { grabDetect(); grabStep(); }
+    rebuildIgnore();                     // шары держащей конечности не сталкиваются с фигурой
     frameContacts.length = 0;
     ji.Step(DT, 1);
+    simSteps++;
     over = Math.max(over, leash());
   }
   return over;
@@ -792,7 +1130,8 @@ function updateStat() {
     padSeen + ' · контактов ' + frameContacts.length + ' · v ' + maxSpeed.toFixed(2) + ' м/с' +
     (maxOver > 0.001 ? ' · leash вжата +' + maxOver.toFixed(3) + ' м' : '') +
     (grabs.size ? ' · держит ' + [...grabs.values()]
-      .map((g) => g.id + ' ' + g.slots.length + ' п.').join(', ') : '') +
+      .map((g) => g.id + ' ' + allSlots(g).length + ' п. (' +
+        sidesOf(g).map((s) => (s ? 'П' : 'Л')).join('+') + ')').join(', ') : '') +
     ' · отправлено ' + sent;
 }
 
@@ -809,8 +1148,10 @@ function jointStats() {
 
 function perfLine() {
   const j = jointStats();
-  // G — что сейчас в захвате: s2 = шар держат 2 сустава. Строка луча короткая, поэтому id одна буква.
-  const G = 'G' + (grabs.size ? [...grabs.values()].map((g) => g.id[0] + g.slots.length).join(',') : '0');
+  // G — что сейчас в захвате: s5LR = шар держат 5 шаров двух рук. Строка луча короткая,
+  // поэтому id фигуры — одна буква.
+  const G = 'G' + (grabs.size ? [...grabs.values()].map((g) => g.id[0] + allSlots(g).length +
+    sidesOf(g).map((s) => (s ? 'R' : 'L')).join('')).join(',') : '0');
   return ['f' + fps.toFixed(0), 'step' + stepMs.toFixed(1), 'fr' + frameMs.toFixed(1),
     'c' + frameContacts.length, 'v' + maxSpeed.toFixed(2), 'pen' + pen.toFixed(3),
     'lv' + maxOver.toFixed(3), 'j' + j.n + '(' + (j.lo * 1000).toFixed(0) + '-' +
@@ -823,8 +1164,10 @@ function fullReport() {
     mode: mode, fps: +fps.toFixed(1), stepMs: +stepMs.toFixed(2), frameMs: +frameMs.toFixed(2),
     contacts: frameContacts.length, v: +maxSpeed.toFixed(3), pen: +pen.toFixed(4),
     leashOver: +maxOver.toFixed(4), src: srcNote, handsMode: handsMode, grabOn: grabOn,
-    grabs: [...grabs.values()].map((g) => ({ id: g.id, side: g.side, slots: g.slots.slice(),
-      span: +gripSpan(g.slots).span.toFixed(4), spanMin: +g.spanMin.toFixed(4) })),
+    grabs: grabState(),
+    // Сколько конечностей сейчас не сталкивается со своей фигурой (включая окно после
+    // отпускания): ignoreSet хранит пару в обоих порядках и по 25 сфер на конечность.
+    ignoreLimbs: Math.round(ignoreSet.size / (2 * HAND_SLOTS)),
     joints: j.n, jointRmin: +j.lo.toFixed(4), jointRmax: +j.hi.toFixed(4),
     bodies: bodyIds.map((id, i) => { const p = posOf(bodiesList[i]); return [id, +p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)]; }),
     anchors: bodyIds.map((id) => { const a = anchors.get(id); return [id, +a.x.toFixed(3), +a.y.toFixed(3), +a.z.toFixed(3)]; }),
@@ -986,7 +1329,18 @@ window.__ja = {
     }));
   },
   cand() { return gripCandidates(); },
+  joinCand() { return joinCandidates(); },
   grabbedIds() { return [...grabbed]; },
+  // Геометрия формы: зазор шара (x,y,z) до поверхности фигуры и нормаль наружу. По ней судятся
+  // «внутри/снаружи» и приход второй руки, поэтому её надо уметь проверить из теста.
+  surface(id, x, y, z) {
+    const s = surfaceInfo(id, x, y, z);
+    return { gap: +s.gap.toFixed(4), n: [+s.nx.toFixed(3), +s.ny.toFixed(3), +s.nz.toFixed(3)] };
+  },
+  ignores() { return Math.round(ignoreSet.size / (2 * HAND_SLOTS)); },
+  graceList() {
+    return grace.map((e) => ({ fig: e.fig, side: e.side, ms: Math.round((e.until - simSteps) * DT * 1000) }));
+  },
   motion(id) {
     const t = bi.GetMotionType(bodies.get(id));
     return t === Jolt.EMotionType_Kinematic ? 'кинематик' : t === Jolt.EMotionType_Dynamic ? 'динамик' : 'стик';

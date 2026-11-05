@@ -189,6 +189,10 @@ const driver = `
     // J. полный скелет обеих кистей: 72 шага, все 52 сферы живые, три фигуры на месте.
     // Про часов тут нет: в --dump-dom виртуальное время внутри синхронного цикла не идёт
     // (=0 мс на любой работе), поэтому цена шага меряется живым браузером в cdp.mjs.
+    // Захват тут выключен: две ладони, сходящиеся на шарике с двух сторон, по новым правилам
+    // захват и ДЕЛАЮТ (ладонь+ладонь разных рук — разрешённая пара), а держимая фигура
+    // перестает толкаться. Толкание проверяется здесь, захват — в блоке L..L13.
+    H.cfg({ grab: false });
     H.park('sphere', 0, 0, 0);
     H.park('torus', 0, 3, 0);
     H.park('cube', 0, -3, 0);
@@ -217,12 +221,35 @@ const driver = `
       ' м/с, поводок выдержан до ' + worstLeash.toFixed(3) + ' м при лимите ' + LEASH +
       ', ошибок ' + H.diag().errs.length);
 
-    // L..L6. захват: предмет с двух сторон держат разные пальцы одной кисти
-    H.cfg({ leash: 0.9 });
-    // Пальцы слева и справа от шарика по x, общий центр. pin(xoff) сжимает, spin поворачивает.
+    // L..L13. захват: зацепляться могут шары РАЗНЫХ групп (палец+палец, палец+ладонь) и
+    // любых рук; держащая конечность выпадает из коллизий с предметом и ещё на секунду после
+    // отпускания, пока её шары внутри; одна рука держит один предмет, две руки — два разных.
+    H.cfg({ grab: true, leash: 0.9 });
+    var FR = 0.013, YSIDE = 0.047;
+    // pin — пара пальцев левой по обе стороны предмета вдоль X; pinR — пара пальцев правой
+    // вдоль Y; pin3 — те же двое плюс безымянный по Y. spin поворачивает цель вокруг предмета.
     function pin(xoff, cz, spin) {
-      H.setJoint(9, xoff, 0, cz, 0.013, spin);       // index-tip левой
-      H.setJoint(14, -xoff, 0, cz, 0.013, spin);     // middle-tip левой
+      H.setJoint(9, xoff, 0, cz, FR, spin);       // index-tip левой
+      H.setJoint(14, -xoff, 0, cz, FR, spin);     // middle-tip левой
+      H.stepTargets(1);
+    }
+    function pin3(xoff, cz, spin) {
+      H.setJoint(19, 0, YSIDE, cz, FR, spin);     // ring-tip той же кисти
+      pin(xoff, cz, spin);
+    }
+    function pinR(yoff, cz, spin) {
+      H.setJoint(34, 0, yoff, cz, FR, spin);      // index-tip правой
+      H.setJoint(39, 0, -yoff, cz, FR, spin);     // middle-tip правой
+      H.stepTargets(1);
+    }
+    // Вся тройка поворачивается вокруг оси Z через центр предмета: расстояния пальцев до
+    // центра не меняются (контакт держится), меняется только конфигурация захвата.
+    function pinRot(xoff, th, cz) {
+      var c = Math.cos(th), s = Math.sin(th), p = [[xoff, 0], [-xoff, 0], [0, YSIDE]];
+      for (var i9 = 0; i9 < 3; i9++) {
+        H.setJoint([9, 14, 19][i9], p[i9][0] * c - p[i9][1] * s,
+          p[i9][0] * s + p[i9][1] * c, cz, FR, 0);
+      }
       H.stepTargets(1);
     }
     // Каждое измерение начинается с чистого кадра: снятый захват, убранные из кадра суставы
@@ -240,6 +267,21 @@ const driver = `
       for (var s = 0; s < 90; s++) { x -= 0.0015; pin(x, cz, 0); if (H.grab().length) return x; }
       return null;
     }
+    function squeeze3(cz) {
+      var x3 = 0.12;
+      for (var s3 = 0; s3 < 90; s3++) {
+        x3 -= 0.0015; pin3(x3, cz, 0);
+        if (H.grab().length) return x3;
+      }
+      return null;
+    }
+    function sidesOfGrab() {
+      return H.grab().map(function (q) {
+        return q.id + ':' + q.sides.map(function (s) { return s ? 'П' : 'Л'; }).join('+');
+      }).join(' ');
+    }
+    function grabIds() { return H.grabbedIds(); }
+    function distTo(p) { var q = H.body('sphere'); return Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z); }
 
     cleanRow();
     var gx = squeezeIn(0);
@@ -263,6 +305,44 @@ const driver = `
     ok('одного пальца мало: захвата нет', H.grab().length === 0 && oneTouch > 10,
       'контактов ' + oneTouch + ' кадров из 60, захватов ' + H.grab().length);
 
+    // L2b. два сустава ОДНОГО пальца с двух сторон — не захват (нужны разные группы шаров)
+    cleanRow();
+    var sameFinger = 0;
+    for (var l2b = 0; l2b < 60; l2b++) {
+      var xb = 0.075 - l2b * 0.0005;
+      H.setJoint(8, xb, 0, 0, FR, 0);            // указательный: средний фаланг
+      H.setJoint(9, -xb, 0, 0, FR, 0);           // тот же палец: кончик, с другой стороны
+      H.stepTargets(1);
+      if (H.info().contacts > 0) sameFinger++;
+    }
+    ok('два сустава одного пальца захват не включают',
+      H.grab().length === 0 && sameFinger > 10,
+      'кадров с контактом ' + sameFinger + ' из 60, захватов ' + H.grab().length);
+
+    // L2c. ладонь с ладонью одной кисти — не держат; ладонь с пальцем — держат
+    cleanRow();
+    for (var l2c = 0; l2c < 60; l2c++) {
+      var xw = 0.09 - l2c * 0.0006;
+      H.setJoint(0, xw, 0, 0, FR, 0);            // запястье
+      H.setJoint(5, -xw, 0, 0, FR, 0);           // плюсневая кость указательного
+      H.stepTargets(1);
+    }
+    var palmPalm = H.grab().length;
+    var palmTouch = H.info().contacts;
+    cleanRow();
+    var wristTake = null;
+    for (var l2d = 0; l2d < 90; l2d++) {
+      wristTake = 0.12 - l2d * 0.0015;
+      H.setJoint(0, wristTake, 0, 0, FR, 0);     // ладонь слева
+      H.setJoint(9, -wristTake, 0, 0, FR, 0);    // кончик указательного справа
+      H.stepTargets(1);
+      if (H.grab().length) break;
+    }
+    ok('ладонь с ладонью не держат, ладонь с пальцем держат',
+      palmPalm === 0 && H.grab().length === 1,
+      'запястье+плюсневая: захватов ' + palmPalm + ' (контактов в кадре ' + palmTouch +
+      '); запястье+кончик: ' + sidesOfGrab() + ' при |x|=' + (wristTake || 0).toFixed(4));
+
     // L3. захват тащит шарик за собой и держит, пока пальцы сжимаются
     cleanRow();
     gx = squeezeIn(0);
@@ -279,12 +359,33 @@ const driver = `
       ' дожима: ' + stillHeld + ', размах ' + (g && H.grab()[0] ? H.grab()[0].span : '-') +
       ' при минимуме ' + (H.grab()[0] ? H.grab()[0].spanMin : '-'));
 
-    // L4. поворот: фигура крутится вместе с пальцами
+    // L4. три шара захвата: их поворот поворачивает шарик (жёсткая подгонка по всем шарам)
+    cleanRow();
+    var g3 = squeeze3(0);
     var qz0 = H.rotAngle('sphere');
-    for (var l4 = 0; l4 <= 60; l4++) pin(gx, zc, l4 * (1.0 / 60));
+    for (var l4 = 0; l4 <= 60; l4++) pinRot(g3, l4 * (1.0 / 60), 0);
     var turned = H.rotAngle('sphere') - qz0;
-    ok('поворот пальцев поворачивает удерживаемый шарик', Math.abs(turned - 1.0) < 0.25,
-      'пальцы провернули 1.000 рад, шарик — ' + turned.toFixed(3) + ' рад');
+    ok('три шара захвата: их поворот поворачивает шарик', g3 !== null &&
+      Math.abs(turned - 1.0) < 0.25,
+      'пальцы провернули 1.000 рад, шарик — ' + turned.toFixed(3) + ' рад; слоты ' +
+      JSON.stringify(H.grab().length ? H.grab()[0].slots : []) + ', взято при |x|=' +
+      (g3 || 0).toFixed(4));
+
+    // L4b. двух шаров для поворота мало: конфигурация вырождена (все на одной прямой),
+    // подгонка отклонена — предмет только переезжает за центром шаров.
+    cleanRow();
+    var g2 = squeezeIn(0);
+    var qz2 = H.rotAngle('sphere');
+    for (var l4b = 0; l4b <= 60; l4b++) {
+      var th2 = l4b * (1.0 / 60), c4 = Math.cos(th2), s4 = Math.sin(th2);
+      H.setJoint(9, g2 * c4, g2 * s4, 0, FR, 0);
+      H.setJoint(14, -g2 * c4, -g2 * s4, 0, FR, 0);
+      H.stepTargets(1);
+    }
+    var twoTurn = H.rotAngle('sphere') - qz2;
+    ok('двух шаров для поворота мало: шарик не крутится',
+      Math.abs(twoTurn) < 0.05,
+      'пальцы провернули 1.000 рад, шарик — ' + twoTurn.toFixed(3) + ' рад');
 
     // L5. в идущий захват новые суставы не добавляются
     var slotsBefore = H.grab()[0] ? H.grab()[0].slots.length : 0;
@@ -306,6 +407,124 @@ const driver = `
       'размах вырос с ' + gx.toFixed(3) + ' до ' + spread.toFixed(3) + ' м (порог 0.030), ' +
       'захватов ' + H.grab().length + ', тело: ' + H.motion('sphere') +
       ', шарик: z=' + H.body('sphere').z.toFixed(3) + ' (было ' + relZ.toFixed(3) + ')');
+
+    // L7. застрявший в предмете палец: держащая конечность выпадает из коллизий, и после
+    // отпускания игнор держится, пока её шары внутри предмета, но не дольше секунды.
+    // Палец при этом шевелится: Jolt перестаёт тестировать пару без движения (замер в node),
+    // а живая рука стоит на месте только в тесте.
+    cleanRow();
+    var gx7 = squeezeIn(0);
+    var limb7 = H.ignores();
+    function wobble(k) {                      // безымянный внутри шарика, вход/выход на 25 мм
+      H.setJoint(19, 0.012 + 0.025 * Math.sin(k * 0.35), 0.006, 0, FR, 0);
+    }
+    wobble(0);
+    H.stepTargets(3);
+    ok('держащая конечность выпадает из коллизий с предметом',
+      limb7 === 1 && H.grab().length === 1,
+      'конечностей в игноре ' + limb7 + ' (у каждой 25 пар), захват ' + sidesOfGrab());
+    var p7 = H.body('sphere');
+    p7 = { x: p7.x, y: p7.y, z: p7.z };
+    var spread7 = gx7;
+    for (var l7 = 0; l7 < 40; l7++) { spread7 += 0.0015; wobble(l7); pin(spread7, 0, 0); }
+    var released7 = H.grab().length === 0;
+    for (var l7b = 0; l7b < 26; l7b++) { wobble(40 + l7b); pin(0.30, 0, 0); }  // рука убрана,
+    var moved7b = distTo(p7);                                                 // палец внутри
+    ok('застрявший в предмете палец его не тащит, пока длится прощение',
+      released7 && moved7b < 0.002,
+      'захват снят: ' + released7 + ', разжат до ' + spread7.toFixed(3) + ' м; сдвиг шарика за ' +
+      (40 + 26) + ' кадров ' + moved7b.toFixed(5) + ' м, grace: ' + JSON.stringify(H.graceList()));
+    for (var l7c = 0; l7c < 80; l7c++) { wobble(66 + l7c); pin(0.30, 0, 0); }  // секунда прошла
+    var moved7c = distTo(p7);
+    var inf7 = H.info();
+    ok('через секунду застрявший палец снова толкает предмет',
+      moved7c > 0.01 && H.ignores() === 0,
+      'сдвиг ' + moved7c.toFixed(3) + ' м, конечностей в игноре ' + H.ignores() +
+      ', grace: ' + JSON.stringify(H.graceList()) + ', тело: ' + H.motion('sphere') +
+      ', контактов в кадре ' + inf7.contacts + ', шарик ' + JSON.stringify(H.body('sphere')));
+
+    // L10. правая в захват не входила — её шары сталкиваются как обычно. Держимый предмет
+    // при этом кинематический, а kinematic<->kinematic контактов не бывает вовсе (замер в
+    // spike.mjs), поэтому толкнуть его нельзя; динамический кубик правая толкает нормально.
+    cleanRow();
+    squeezeIn(0);
+    H.park('cube', 0.45, 0, 0); H.stepTargets(1);
+    var ball10 = H.body('sphere');
+    for (var l10 = 0; l10 < 60; l10++) {
+      H.setJoint(34, 0.12 - l10 * 0.0015, 0, 0, FR, 0);
+      H.stepTargets(1);
+    }
+    var b10 = H.body('sphere');
+    var pushedBall = Math.hypot(b10.x - ball10.x, b10.y - ball10.y, b10.z - ball10.z);
+    var cubeA = H.body('cube'), limb10 = H.ignores();
+    for (var l10b = 0; l10b < 100; l10b++) {
+      H.setJoint(34, 0.62 - l10b * 0.002, 0, 0, FR, 0);
+      H.stepTargets(1);
+    }
+    var pushedCube = Math.abs(H.body('cube').x - cubeA.x);
+    ok('в игноре только держащая рука: кубик правая толкает, держимый шарик — нет',
+      pushedCube > 0.02 && pushedBall < 0.002 && limb10 === 1,
+      'кубик сдвинут на ' + pushedCube.toFixed(3) + ' м, держимый шарик на ' +
+      pushedBall.toFixed(5) + ' м, конечностей в игноре ' + limb10);
+
+    // L11. левая держит шарик, правая держит кубик — два независимых захвата сразу
+    cleanRow();
+    var gx11 = squeezeIn(0);
+    H.park('cube', 0.45, 0, 0); H.stepTargets(1);
+    for (var l11 = 0; l11 < 90; l11++) {
+      var d11 = 0.13 - l11 * 0.0015;
+      H.setJoint(34, 0.45 + d11, 0, 0, FR, 0);
+      H.setJoint(39, 0.45 - d11, 0, 0, FR, 0);
+      H.stepTargets(1);
+      if (H.grab().length === 2) break;
+    }
+    var ids11 = grabIds();
+    ok('две руки держат разные предметы одновременно', H.grab().length === 2 &&
+      ids11.indexOf('sphere') >= 0 && ids11.indexOf('cube') >= 0, 'захваты: ' + sidesOfGrab());
+    var cz11 = 0;
+    for (var l11b = 0; l11b < 70; l11b++) {
+      cz11 += 0.0025;
+      H.setJoint(34, 0.45 + d11, 0, cz11, FR, 0);
+      H.setJoint(39, 0.45 - d11, 0, cz11, FR, 0);
+      pin(gx11, 0, 0);                          // левая при этом стоит
+    }
+    var cube11 = H.body('cube'), ball11 = H.body('sphere');
+    ok('кубик едет за правой, шарик остаётся у левой',
+      Math.abs(cube11.z - cz11) < 0.02 && Math.hypot(ball11.x, ball11.z) < 0.01 &&
+      H.grab().length === 2,
+      'кубик z=' + cube11.z.toFixed(3) + ' (правая на z=' + cz11.toFixed(3) + '), шарик x=' +
+      ball11.x.toFixed(3) + ' z=' + ball11.z.toFixed(3) + ', захватов ' + H.grab().length);
+
+    // L12/L13. передача предмета из руки в руку: вторая конечность входит в идущий захват,
+    // первая разжимается — предмет остаётся у второй и едет за ней.
+    cleanRow();
+    var gx12 = squeezeIn(0);
+    var y12 = null, joined12 = false;
+    for (var l12 = 0; l12 < 90; l12++) {
+      y12 = 0.12 - l12 * 0.0015;
+      pinR(y12, 0, 0);
+      if (H.grab().length === 1 && H.grab()[0].sides.length === 2) { joined12 = true; break; }
+    }
+    var g12 = H.grab()[0];
+    ok('правая входит в захват левой: предмет держат две конечности',
+      joined12 && g12.slots.length >= 4,
+      g12 ? sidesOfGrab() + ' слоты ' + JSON.stringify(g12.slots) + ', пальцы правой в ' +
+      (y12 || 0).toFixed(4) + ' м от центра (касание — на ' + (0.035 + FR).toFixed(3) + ' м)'
+        : 'захвата нет');
+    var sp12 = gx12;
+    for (var l13 = 0; l13 < 45; l13++) { sp12 += 0.0015; pin(sp12, 0, 0); pinR(y12, 0, 0); }
+    var g13 = H.grab()[0];
+    ok('левая разжалась — предмет остался в захвате правой',
+      g13 && g13.sides.length === 1 && H.motion('sphere') === 'кинематик',
+      g13 ? sidesOfGrab() + ' слоты ' + JSON.stringify(g13.slots) + ', левая разжата до ' +
+      sp12.toFixed(3) + ' м, тело: ' + H.motion('sphere') : 'захвата нет');
+    var zc13 = 0;
+    for (var l13b = 0; l13b < 70; l13b++) { zc13 += 0.0025; pin(0.30, zc13, 0); pinR(y12, zc13, 0); }
+    var b13 = H.body('sphere');
+    ok('после передачи шарик едет за правой рукой',
+      Math.abs(b13.z - zc13) < 0.02 && H.grab().length === 1,
+      'правая на z=' + zc13.toFixed(3) + ', шарик z=' + b13.z.toFixed(3) + ', захватов ' +
+      H.grab().length);
     H.parkFingers(); H.stepTargets(3);
 
     // E. place() — «перед собой»: якоря и тела совпадают

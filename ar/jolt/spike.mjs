@@ -116,10 +116,14 @@ function sphere(r) { const sh = new Jolt.SphereShape(r); alive.push(sh); return 
 /* --------------- контакты: манifold'ы слушателя, не WereBodiesInContact ----
  * (Н9, Н10). Слушатель отдаёт и точки касания — их же will использовать страница. */
 let frameContacts = [];
+let rejectPair = null;                 // (Н13) пара ключей тел, которую narrowphase пропускает
 class TouchListener extends Jolt.ContactListenerJS {
   constructor() {
     super();
-    this.OnContactValidate = () => Jolt.ValidateResult_AcceptContact;
+    this.OnContactValidate = (b1, b2) => (rejectPair &&
+      ((bodyNum(b1) === rejectPair[0] && bodyNum(b2) === rejectPair[1]) ||
+       (bodyNum(b1) === rejectPair[1] && bodyNum(b2) === rejectPair[0])))
+      ? Jolt.ValidateResult_RejectContact : Jolt.ValidateResult_AcceptContact;
     this.OnContactAdded = (b1, b2, mp) => rec(b1, b2, mp);
     this.OnContactPersisted = (b1, b2, mp) => rec(b1, b2, mp);
     this.OnContactRemoved = () => {};
@@ -464,6 +468,93 @@ const torus32 = torusShape(32);
     p2.x - p.x > 0.25, 'скорость сразу после перехода ' + vKeep.toFixed(3) + ' м/с, пролетело ещё ' +
     (p2.x - p.x).toFixed(3) + ' м за 1 с');
   drop(held);
+}
+
+// ---- 13. игнор пары: OnContactValidate умеет пропускать пару (Н13) --------
+// На этом держится правило «шары держащей конечности не толкают держимую фигуру, шары другой
+// руки — толкают». Проверяем и имя константы, и то, что отказ действительно убирает контакт.
+{
+  ok('у Jolt есть ValidateResult_RejectContact — чем и откатываются пары',
+    Jolt.ValidateResult_RejectContact !== undefined,
+    'RejectContact=' + Jolt.ValidateResult_RejectContact +
+    ' AcceptContact=' + Jolt.ValidateResult_AcceptContact);
+
+  const fig = add(sphere(0.035), 0, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE);
+  const fin = add(sphere(FINGER_R), 0, 0, 0, Jolt.EMotionType_Kinematic, L_HAND);
+  const keyFig = fig.GetIndexAndSequenceNumber(), keyFin = fin.GetIndexAndSequenceNumber();
+
+  // Палец вдавливается в шарик слева; повторить то же самое с отказом по паре.
+  function pushIn() {
+    bi.SetPositionAndRotation(fin, V(-(0.035 + FINGER_R + 0.003), 0, 0),
+      Jolt.Quat.prototype.sIdentity(), Jolt.EActivate_Activate);
+    bi.SetLinearVelocity(fig, V(0, 0, 0));
+    bi.SetAngularVelocity(fig, V(0, 0, 0));
+    bi.SetPositionAndRotation(fig, V(0, 0, 0), Jolt.Quat.prototype.sIdentity(),
+      Jolt.EActivate_Activate);
+    let man = 0;
+    for (let f = 0; f < 30; f++) {
+      bi.SetLinearVelocity(fin, V(0.002 / DT, 0, 0));     // 0.2 мм/кадр, как в тестах страницы
+      step();
+      if (touching(fig, fin)) man++;
+    }
+    return { moved: pos(fig).x, man };
+  }
+
+  const accepted = pushIn();
+  rejectPair = [keyFig, keyFin];
+  const rejected = pushIn();
+  rejectPair = null;
+  ok('RejectContact по паре: контакт пропадает, фигура не сдвигается ни на микрон',
+    accepted.moved > 0.005 && accepted.man > 0 && rejected.man === 0 &&
+    Math.abs(rejected.moved) < 1e-6,
+    'без отказа: сдвиг ' + accepted.moved.toFixed(4) + ' м, кадров с контактом ' + accepted.man +
+    '; с отказом: сдвиг ' + rejected.moved.toExponential(1) + ' м, контактов ' + rejected.man);
+  drop(fin); drop(fig);
+}
+
+// ---- 13b. отклонённая пара засыпает, и будит её только движение (Н13b) -----
+// Отсюда в странице два следствия: окно прощения считается ШАГАМИ физики (часами в headless
+// оно не меряется), а проверка «сняли игнор — палец снова толкает» обязана шевелить палец:
+// Jolt перестаёт тестировать пару, у которой долго не было контактов, и стоячая на месте пара
+// после снятия отказа так и не оживает.
+{
+  const fig = add(sphere(0.035), 0, 0, 0, Jolt.EMotionType_Dynamic, L_SHAPE);
+  const fin = add(sphere(FINGER_R), 0.20, 0, 0, Jolt.EMotionType_Kinematic, L_HAND);
+  const kf = fig.GetIndexAndSequenceNumber(), kn = fin.GetIndexAndSequenceNumber();
+
+  // Палец едет к (fx, 0, 0) так же, как drive() в странице: скоростью за кадр.
+  function driveTo(fx) {
+    const p = pos(fin);
+    bi.SetLinearVelocity(fin, V((fx - p.x) / DT, 0, 0));
+    step();
+  }
+
+  rejectPair = [kf, kn];
+  let manRejected = 0;
+  for (let f = 0; f < 120; f++) { driveTo(0.0134); if (touching(fig, fin)) manRejected++; }
+
+  rejectPair = null;                              // игнор снят, палец стоит внутри шарика
+  let manStill = 0;
+  for (let f = 0; f < 60; f++) { driveTo(0.0134); if (touching(fig, fin)) manStill++; }
+  const slept = pos(fig);
+
+  let manWake = 0, firstWake = -1;
+  for (let f = 0; f < 120; f++) {                 // палец шевелится: внутрь/наружу на 50 мм
+    driveTo(0.0134 + 0.05 * Math.sin(f * 0.3));
+    if (touching(fig, fin)) { manWake++; if (firstWake < 0) firstWake = f; }
+  }
+  const woke = pos(fig);
+
+  ok('отказ пары её усыпляет: сняли отказ — стоячая пара по-прежнему не тестируется',
+    manRejected === 0 && manStill === 0,
+    'кадров с контактом при отказе ' + manRejected + ' из 120, после снятия отказа ' +
+    manStill + ' из 60');
+  ok('движение будит пару: контакты возвращаются, фигуру выталкивает',
+    manWake > 0 && Math.hypot(woke.x, woke.y) > 0.05,
+    'кадров с контактом ' + manWake + ' из 120, первый на шаге ' + firstWake +
+    '; фигура вылетела с ' + Math.hypot(slept.x, slept.y).toFixed(4) + ' до ' +
+    Math.hypot(woke.x, woke.y).toFixed(4) + ' м — глубокое перекрытие разрешается за кадр-два');
+  drop(fin); drop(fig);
 }
 
 // ---- 11. мир переиспользуется (Н3) ---------------------------------------

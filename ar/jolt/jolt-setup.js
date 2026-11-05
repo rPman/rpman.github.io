@@ -112,13 +112,23 @@ export function alignQuat(Jolt, fromVec, toVec) {
 
 /* Манifold'ы кадров: предикат контактов и точки касания. WereBodiesInContact отвечает только
  * «была ли пара», глубины и точек там нет. Методы — собственные свойства: embind проверяет
- * hasOwnProperty и иначе падает на первом шаге. */
-export function contactRecorder(Jolt, alive, ps) {
+ * hasOwnProperty и иначе падает на первом шаге.
+ *
+ * validate(aPtr, bPtr, keyOf) -> true означает «пару пропустить»: ответ возвращается заново
+ * каждый шаг, состояние в биндинге не копим (именно так работает игнор коллизий для конечности,
+ * держащей предмет). Грабелька, о которой надо помнить (спайк, проверки 13b): пару, которую
+ * отклоняют долго, Jolt перестаёт тестировать в narrowphase вовсе, и после снятия отказа стоячая
+ * на месте пара не оживает — контакты вернутся только когда что-то из пары пошевелится
+ * (SetUseCollisionActivation / SetCollide / mNumStepsBetweenCollisionTestActivation в этом
+ * JS-билдинге не экспортированы, так что будить пару нечем). */
+export function contactRecorder(Jolt, alive, ps, validate) {
   const store = [];
+  const keyOf = (p) => Jolt.wrapPointer(p, Jolt.Body).GetID().GetIndexAndSequenceNumber();
   class Listener extends Jolt.ContactListenerJS {
     constructor() {
       super();
-      this.OnContactValidate = () => Jolt.ValidateResult_AcceptContact;
+      this.OnContactValidate = (a, b) => (validate && validate(a, b, keyOf)
+        ? Jolt.ValidateResult_RejectContact : Jolt.ValidateResult_AcceptContact);
       this.OnContactAdded = (a, b, mp) => rec(a, b, mp);
       this.OnContactPersisted = (a, b, mp) => rec(a, b, mp);
       this.OnContactRemoved = () => {};
