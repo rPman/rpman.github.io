@@ -60,8 +60,10 @@ const handSlot = (side, j) => side * HAND_SLOTS + j;
 const CTRL_SLOT = 2 * HAND_SLOTS;         // 50, 51 — контроллеры, когда руки не читаются
 const MAX_SLOTS = 2 * HAND_SLOTS + 2;     // 52 кинематических сферы максимум
 
-/* Query-параметры — единственный способ переключать режим в шлеме: на PICO 4 Ultra
- * dom-overlay не выдаётся (start|feat=…|ovl=нет), так что кнопок HUD в AR не видно. */
+/* Query-параметры задают НАЧАЛЬНЫЕ значения: основной способ управления — панель на
+ * стартовой странице (в AR кнопок нет: на PICO 4 Ultra dom-overlay не выдаётся, но
+ * стартовая страница в браузер шлема попадает). Параметры оставлены, потому что живые
+ * ссылки вида ?open=60 и замерные прогоны на них держатся. */
 const QS = new URLSearchParams(location.search);
 let handsMode = QS.get('hands') === 'index' ? 'index' : 'full';
 let showHands = QS.get('proxy') !== '0';
@@ -1447,7 +1449,7 @@ function enterAR() {
     noteEl.textContent = session.domOverlayState
       ? 'Щипок — перенести фигуры перед собой. Кулак — отладочный отчёт на сервер.'
       : 'DOM-оверлей не дан: кнопок в шлеме не видно, но жесты работают: щипок — перенести, ' +
-        'кулак — отчёт. Режимы (hands=index, proxy=0, leash=…) — в адресной строке.';
+        'кулак — отчёт. Режимы и пороги выставляются на стартовой странице (выход из AR — в ней же).';
 
     session.addEventListener('select', () => placeInFrontOfHead(lastFrame, lastRef));
     session.addEventListener('squeeze', () => beacon('FULL|' + fullReport()));
@@ -1484,13 +1486,56 @@ el('preview').addEventListener('click', () => {
     'Это превью: объёма тут нет, шарик в кольцо входит в AR, где кисть даёт 25 суставов.';
 });
 el('btnReset').addEventListener('click', () => placeInFrontOfHead(lastFrame, lastRef));
-el('btnHands').addEventListener('click', () => { showHands = !showHands; });
+el('btnHands').addEventListener('click', () => { showHands = !showHands; optSync(); });
 el('btnGrab').addEventListener('click', () => {
   grabOn = !grabOn;
   if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'btn');
-  el('btnGrab').textContent = grabOn ? 'Захват вкл' : 'Захват выкл';
+  optSync();
 });
 el('btnReport').addEventListener('click', () => beacon('FULL|' + fullReport()));
+
+/* -------------------------------------------------- настройки на старте */
+/* Режимы и пороги правятся на стартовой странице, а не в адресной строке: dom-overlay шлем
+ * не выдаёт, поэтому в AR кнопок нет, но стартовая страница в браузер шлема попадает, и
+ * всё можно выбрать ДО входа в сессию (а в превью — на лету). Query-параметры остались и
+ * определяют НАЧАЛЬНЫЕ значения полей: живые ссылки вида ?open=60 и прогоны не ломаются,
+ * просто теперь их видно в ползунках. Значения читаются из переменных, а не из полей: поле
+ * вне своего диапазона браузер молча сдвигает, и чтение обратно показало бы не то число,
+ * которым мир реально живёт (например ?leash=5). */
+const OPTS = [
+  { id: 'oGrab', get: () => grabOn,
+    set: (v) => { grabOn = v; if (!v) for (const [, g] of [...grabs]) grabEnd(g, 'opt'); } },
+  { id: 'oProxy', get: () => !!showHands, set: (v) => { showHands = v; } },
+  { id: 'oHands1', get: () => handsMode === 'index', set: (v) => { handsMode = v ? 'index' : 'full'; } },
+  { id: 'oBeacon', get: () => beaconOn, set: (v) => { beaconOn = v; } },
+  // миллиметры: GRAB_* живут в метрах
+  { id: 'oOpen', get: () => Math.round(GRAB_OPEN * 1000), set: (v) => { GRAB_OPEN = v / 1000; } },
+  { id: 'oFit', get: () => Math.round(GRAB_FIT * 1000), set: (v) => { GRAB_FIT = v / 1000; } },
+  { id: 'oSlip', get: () => Math.round(GRAB_SLIP * 1000), set: (v) => { GRAB_SLIP = v / 1000; } },
+  { id: 'oFollow', dec: 2, get: () => GRAB_FOLLOW, set: (v) => { GRAB_FOLLOW = Math.min(1, v); } },
+  { id: 'oTip', unit: ' %', get: () => Math.round(TIP_EXTEND * 100), set: (v) => { TIP_EXTEND = v / 100; } },
+  { id: 'oLeash', dec: 2, unit: ' м', get: () => leashMeters, set: (v) => { leashMeters = v; } },
+];
+function optSync() {
+  for (const o of OPTS) {
+    const inp = el(o.id), out = el(o.id + 'V');
+    if (!inp) continue;
+    const v = o.get();
+    if (inp.type === 'checkbox') inp.checked = !!v;
+    else {
+      inp.value = v;
+      if (out) out.textContent = (o.dec ? (+v).toFixed(o.dec) : String(v)) + (o.unit || '');
+    }
+  }
+  el('btnGrab').textContent = grabOn ? 'Захват вкл' : 'Захват выкл';
+}
+for (const o of OPTS) {
+  const inp = el(o.id);
+  if (!inp) continue;
+  const read = () => (inp.type === 'checkbox' ? inp.checked : +inp.value);
+  inp.addEventListener('input', () => { o.set(read()); optSync(); });
+}
+optSync();
 
 window.addEventListener('resize', () => {
   if (renderer.xr.isPresenting) return;   // setSize во время сессии — no-op
@@ -1563,6 +1608,13 @@ window.__ja = {
     }
   },
   freeze(v) { frozen = !!v; },
+  // Текущие настройки — те же числа, что показывает панель стартовой страницы. Тесту нужно,
+  // чтобы проверить двусторонность панели: поле отражает мир, а правка поля меняет мир.
+  settings() {
+    return { handsMode: handsMode, proxy: !!showHands, grabOn: grabOn, beaconOn: beaconOn,
+      open: GRAB_OPEN, fit: GRAB_FIT, slip: GRAB_SLIP, follow: GRAB_FOLLOW, tip: TIP_EXTEND,
+      leash: leashMeters };
+  },
   /* Захват изнутри страницы: состояние, перевод тела и ручной ввод суставов (для тестов без
    * шлема: тот же путь, что и живой цикл — цели в targets, шаг через fromTargets). */
   grab() { return grabState(); },

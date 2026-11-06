@@ -11,22 +11,40 @@
                font:14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   canvas { display:block; }
 
+  /* Стартовая страница. Она же — панель настроек: dom-overlay шлем не выдаёт, поэтому в AR
+   * кнопок нет, но сюда браузер шлема попадает, и режимы выбирают ДО входа в сессию.
+   * Кнопки приклеены к низу: что бы ни осталось на экране, «Войти в AR» видно без прокрутки. */
   #start { position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
-           padding:22px; overflow:auto;
+           padding:6px 18px; overflow:auto;
            background:radial-gradient(120% 120% at 50% 0%, #101822 0%, #0b0e13 70%); }
   body.running #start { display:none; }
-  .card { width:min(640px,100%); }
-  h1 { font-size:21px; margin:0 0 4px; }
-  .sub { color:var(--dim); margin:0 0 14px; }
-  ul { margin:0 0 14px; padding-left:20px; color:var(--dim); }
-  ul b { color:var(--fg); }
-  code { color:var(--ac); font:inherit; }
+  .card { width:min(660px,100%); font-size:12.5px; }
+  h1 { font-size:17px; margin:0 0 2px; }
+  .sub { color:var(--dim); margin:0 0 6px; line-height:1.35; }
+  .sub b { color:var(--fg); font-weight:600; }
+  .sp { color:#ff6b57; } .ri { color:#ffd24a; } .cu { color:#57b6ff; }
+  #status { color:var(--dim); font-size:11.5px; margin:0 0 6px; white-space:pre-wrap; }
   .row { display:flex; gap:10px; flex-wrap:wrap; margin:0 0 12px; }
-  button { font:inherit; padding:11px 15px; border-radius:10px; border:1px solid #2b3a4c;
+  button { font:inherit; padding:10px 15px; border-radius:10px; border:1px solid #2b3a4c;
            background:#132030; color:var(--fg); cursor:pointer; }
   button:hover:not(:disabled) { border-color:var(--ac); }
   button:disabled { opacity:.45; cursor:default; }
   button.main { background:var(--ac); border-color:var(--ac); color:#04131f; font-weight:700; }
+  #start .go { position:sticky; bottom:0; margin:4px 0 0; padding:4px 0 0;
+               background:linear-gradient(#0b0e1300,#0b0e13 34%); }
+
+  .opts { display:grid; gap:2px 9px; margin:0; }
+  /* Галки — в один ряд (они короткие), ползунки — в два: иначе карточка не влезает в окно
+   * браузерного экрана шлема без прокрутки. */
+  .opts.checks { grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+  .opts.nums { grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); }
+  .opt { display:flex; flex-direction:column; gap:1px; padding:2px 7px; border:1px solid #1e2836;
+         border-radius:9px; background:#0e141c; cursor:pointer; }
+  .opt > span { display:flex; align-items:center; gap:7px; }
+  .opt i { display:block; color:var(--dim); font-size:11px; font-style:normal; line-height:1.2; }
+  .opt input[type=checkbox] { width:15px; height:15px; accent-color:var(--ac); flex:none; }
+  .opt input[type=range] { flex:1 1 70px; height:16px; accent-color:var(--ac); }
+  .opt output { color:var(--ac); min-width:50px; text-align:right; font-variant-numeric:tabular-nums; }
 
   /* HUD — корень dom-overlay. Если шлем DOM не показывает, остаются жесты: щипок и кулак. */
   #hud { position:fixed; left:12px; right:12px; bottom:12px; z-index:20; display:none;
@@ -40,7 +58,6 @@
   #hud button { padding:7px 11px; font-size:13px; }
   #err { position:fixed; left:12px; right:12px; bottom:12px; z-index:30; display:none;
          padding:12px 14px; border:1px solid #6a2a1a; border-radius:12px; background:#2a1108; color:#ffd9c7; }
-  #status { color:var(--dim); margin:0 0 10px; white-space:pre-wrap; }
   #report { position:fixed; left:0; bottom:0; margin:0; color:#7c848d; font:11px/1.3 monospace;
             white-space:pre-wrap; opacity:.3; max-height:40vh; overflow:hidden; }
 </style>
@@ -50,82 +67,46 @@
 <div id="start">
   <div class="card">
     <h1>AR: фигуры на Jolt, их толкает кисть</h1>
-    <p class="sub">Три фигуры поверх реального окружения: <span style="color:#ff6b57">шар</span>,
-      <span style="color:#ffd24a">кольцо</span>, <span style="color:#57b6ff">куб</span>. Формы честные —
-      кольцо настояще дырявое (16 капсул по кольцу, примитива тора в Jolt нет), у куба есть рёбра и углы.</p>
+    <p class="sub">
+      Над реальным окружением три фигуры: <b class="sp">шар</b>, <b class="ri">кольцо</b>,
+      <b class="cu">куб</b>. Формы честные — кольцо настояще дырявое, у куба есть рёбра и углы,
+      поэтому шарик можно <b>ввести внутрь кольца</b>. Толкает <b>реальная кисть</b>: 25
+      сфер-суставов на руку, если кисть не читается — контроллер. <b>Щепоть из двух разных
+      пальцев или две руки</b> берут предмет за точки касания: он едет за центром захвата и
+      поворачивается, пока кисть не раскрылась. Фигуры не улетают: торможение и поводок.
+      Нужен шлем с passthrough-AR и <b>https</b>; щипок переносит фигуры перед собой.</p>
     <div id="status">загрузка jolt…</div>
-    <ul>
-      <li><b>Толкает кисть:</b> на каждую руку 25 суставов-сфер, радиус берётся из
-        <b>XRJointPose.radius</b>, но <b>вполовину</b> (clamp 2–15 мм): без этого ладонь на PICO
-        выходит вдвое толще настоящей и пальцы сливаются в один комок. Работает и кончик
-        пальца, и вся ладонь. Рука приоритетнее контроллера; если кисть не читается — в том же
-        слоте работает контроллер (сфера 20 мм). <b>Сферы кончиков вынесены вперёд</b>: поза
-        <code>*-tip</code> в XR стоит на суставе концевой фаланги, а не на коже, а плоть кончика
-        лежит за ней ещё примерно на radius — с половинным радиусом сфера оканчивалась в 7 мм от
-        сустава там, где настоящий кончик в ~14 мм. Теперь сфера кончика сдвинута наружу вдоль
-        кости пальца на половину сырого radius (<code>?tip=30</code>, <code>?tip=0</code> — как
-        было).</li>
-      <li><b>Захват — по физике процесса, а не по жесту:</b> предмет берут шары из <b>разных
-        групп</b>, и зацепление ставят только <b>две разные руки</b> либо <b>два разных пальца
-        одной руки</b> (щепоть). Два шара одного пальца или одной ладони зацепить предмет не
-        могут — такой захват нечем расцепить; <b>ладонь с пальцем той же руки зацепление тоже не
-        ставит</b>: ладонь на PICO — шесть крупных шаров, и её касания вместе с пальцем этой же
-        руки хватало, чтобы кубик прилип, а отпускалось это только когда пальцы наконец
-        разгибались. Ладонь с ладонью <b>двух</b> рук — законная пара: так предмет держат двумя
-        руками.
-        Каждый шар захвата запоминает <b>точку на самом предмете</b>, в которой он его взял, и
-        дальше предмет едет и поворачивается так, чтобы эти точки шли за шарами руки. Поэтому
-        поворот передаётся и <b>двумя пальцами</b>, и ладонью: раньше он считался как жёсткая
-        подгонка по всем шарам сразу, и захват из двух-пяти шаров (ладонь на грани 100-мм куба)
-        был вырожден — куб только ехал за рукой, тогда как бублик крутился (его трубу 25 мм
-        пальцы обхватывают). Направление, которого шары захвата не видят (закручивание вокруг оси
-        пары), предмету не навязывается.
-        <b>Раскрытие кисти меряется по самой кисти</b>, а не по предмету (предмет едет за рукой,
-        поэтому относительно предмета раскрытая ладонь не видна вовсе): по наибольшему
-        расстоянию между шарами захвата и по сгибу пальцев — <code>|кончик − его плюсневая
-        кость|</code>. Отпускание, когда что-то одно выросло больше чем на <b>45 мм</b> от самого
-        сжатого положения этой руки. Если предмет держат <b>обе</b> руки, есть третье условие:
-        разъезд держателей. Размах и сгиб каждой ладони при этом не меняются вовсе (ладонь сама по
-        себе остаётся ладонью, просто её уносят от другой ладони), поэтому меряется несовместимость
-        держателей с одним жёстким предметом — <b>невязка кадра захвата</b>. Растёт больше
-        <b>60 мм</b> — предмет отпускают обе руки сразу. Есть и четвёртое условие — <b>уход руки
-        от предмета</b>: если все шары державшей руки вышли из его формы больше чем на <b>60 мм</b>
-        и стоят так <b>0.25 с</b> (предмет не донёсся: упёрся в поводок, в другую фигуру или в
-        предел скорости), рука его отпускает — три прежние меры смотрят на кисть и такого разрыва
-        не видят вовсе. Пропадание кисти из виду предмет не рвёт:
-        мигание трекинга на PICO есть всегда, отпускает только потеря дольше <b>0.5 с</b>.</li>
-      <li><b>Красные точки.</b> Обычно это точки касания. У держащей руки касаний нет вовсе — её
-        шары намеренно исключены из коллизий с предметом, иначе пальцы не вошли бы в него.
-        Держатели поэтому дорисовываются отдельно: по точке на поверхности предмета под каждым
-        шаром, который сейчас держит. Нет точек — не держит.</li>
-      <li><b>Держимый предмет — обычное тело:</b> на время захвата он не становится призраком, а
-        ведётся скоростью за рукой. Поэтому его толкает вторая рука, и два держимых предмета
-        упираются друг в друга, а не проходят насквозь. Держащая рука перестаёт сталкиваться с
-        своим предметом (и ещё <b>секунду</b> после отпускания — пока её шары не выйдут из
-        предмета), обратно тот же предмет она возьмёт не сразу, а только когда палец выйдет или
-        пройдёт та же секунда. Левая рука может передать предмет правой: вторая входит в тот же
-        захват, первая разжимается. Каждая рука держит свой предмет. Контроллер захвата не
-        делает.</li>
-      <li><b>Движение трёхмерное:</b> шарик можно ввести ВНУТРЬ кольца, а не водить по экрану.
-        Дырка кольца развёрнута вдоль взгляда.</li>
-      <li><b>Фигуры не улетают:</b> торможение 6 1/с (≈1 с до остановки) и поводок 0.9 м вокруг
-        точки появления — дальше ни один удар не выносит фигуру за экран.</li>
-      <li>Нужен шлем с passthrough-AR и <b>https</b>. Щипок переносит фигуры перед собой,
-        сжатие кулака отправляет отладочный отчёт.</li>
-      <li><b>Если шлем не даёт DOM-интерфейс</b> (PICO 4 Ultra не даёт — кнопок в AR не будет),
-        режимы переключаются в адресной строке: <code>?hands=index</code> — только указательный
-        вместо 25 суставов (в этом режиме захвата нет: держать должны два разных пальца одной
-        кисти), <code>?grab=0</code> — выключить захват, <code>?open=60</code> — порог
-        раскрытия кисти в миллиметрах (по умолчанию 45), <code>?fit=80</code> — порог разъезда
-        двух держящих рук в миллиметрах (по умолчанию 60), <code>?slip=80</code> — порог ухода
-        руки от предмета в миллиметрах (по умолчанию 60), <code>?follow=0.4</code> — насколько
-        жёстко держимый предмет догоняет руку (по умолчанию 0.6), <code>?tip=30</code> — на
-        сколько долей радиуса выносить сферы кончиков за сустав (по умолчанию 50),
-        <code>?proxy=0</code> —
-        спрятать сферы суставов, <code>?leash=1.5</code> — другой поводок,
-        <code>?nobeacon</code> — не слать отладку.</li>
-    </ul>
-    <div class="row">
+    <div class="opts checks">
+      <label class="opt"><span><input id="oGrab" type="checkbox" checked><b>Захват</b></span>
+        <i>два пальца или две руки</i></label>
+      <label class="opt"><span><input id="oProxy" type="checkbox" checked><b>Сферы суставов</b></span>
+        <i>proxy-сферы кисти</i></label>
+      <label class="opt"><span><input id="oHands1" type="checkbox"><b>Только указательный</b></span>
+        <i>1 сфера на руку</i></label>
+      <label class="opt"><span><input id="oBeacon" type="checkbox" checked><b>Отладочный луч</b></span>
+        <i>строка в nginx-лог</i></label>
+    </div>
+    <div class="opts nums">
+      <label class="opt"><span><b>Раскрытие</b><input id="oOpen" type="range" min="10" max="150"
+        step="5" value="45"><output id="oOpenV">45 мм</output></span>
+        <i>размах шаров захвата до отпускания</i></label>
+      <label class="opt"><span><b>Разъезд рук</b><input id="oFit" type="range" min="10" max="150"
+        step="5" value="60"><output id="oFitV">60 мм</output></span>
+        <i>держатели разошлись не как одно целое</i></label>
+      <label class="opt"><span><b>Уход руки</b><input id="oSlip" type="range" min="10" max="150"
+        step="5" value="60"><output id="oSlipV">60 мм</output></span>
+        <i>все шары руки вне формы 0.25 с</i></label>
+      <label class="opt"><span><b>Ведение</b><input id="oFollow" type="range" min="0.05" max="1"
+        step="0.05" value="0.6"><output id="oFollowV">0.60</output></span>
+        <i>доля рассогласования, выбираемая за шаг</i></label>
+      <label class="opt"><span><b>Кончики</b><input id="oTip" type="range" min="0" max="100"
+        step="5" value="50"><output id="oTipV">50 %</output></span>
+        <i>доли сырого XR-radius за сустав</i></label>
+      <label class="opt"><span><b>Поводок</b><input id="oLeash" type="range" min="0.2" max="3"
+        step="0.1" value="0.9"><output id="oLeashV">0.90 м</output></span>
+        <i>дальше фигура не уйдёт от якоря</i></label>
+    </div>
+    <div class="row go">
       <button id="enterAR" class="main">Войти в AR</button>
       <button id="preview">Предпросмотр без шлема</button>
     </div>

@@ -933,6 +933,46 @@ const driver = `
     ok('всё конечно', inf2.bodies.every(function (q) {
       return isFinite(q.x) && isFinite(q.y) && isFinite(q.z) && isFinite(q.speed) && isFinite(q.leash); }),
       JSON.stringify(inf2.bodies));
+
+    // G. панель настроек на стартовой странице. Прежний единственный способ крутить пороги —
+    // query-параметры (?open=60, ?leash=1.5, ?hands=index), что в шлеме означает «правка
+    // адресной строки». Проверка двусторонняя: поля показывают те же числа, которыми живёт
+    // мир, и правка поля действительно меняет значение, которым пользуется шаг физики.
+    var OPT_IDS = ['oGrab', 'oProxy', 'oHands1', 'oBeacon', 'oOpen', 'oFit', 'oSlip',
+      'oFollow', 'oTip', 'oLeash'];
+    var missOpt = OPT_IDS.filter(function (i) { return !document.getElementById(i); });
+    var set0 = H.settings();
+    var fOpen = document.getElementById('oOpen'), fGrab = document.getElementById('oGrab');
+    var shown0 = fOpen.value + '/' + fGrab.checked + '/' + document.getElementById('oOpenV').textContent;
+    fOpen.value = '70'; fOpen.dispatchEvent(new Event('input'));
+    var open70 = H.settings().open;
+    fGrab.checked = false; fGrab.dispatchEvent(new Event('input'));
+    var grabOff = H.settings().grabOn;
+    fOpen.value = String(Math.round(set0.open * 1000)); fOpen.dispatchEvent(new Event('input'));
+    fGrab.checked = true; fGrab.dispatchEvent(new Event('input'));
+    var back0 = H.settings();
+    ok('пороги и режимы правятся на стартовой странице, а не в адресной строке',
+      missOpt.length === 0 && fOpen.value === String(Math.round(set0.open * 1000)) &&
+      fGrab.checked === true && Math.abs(open70 - 0.07) < 1e-9 && grabOff === false &&
+      Math.abs(back0.open - set0.open) < 1e-9 && back0.grabOn === true,
+      OPT_IDS.length + ' полей' + (missOpt.length ? ', НЕТ: ' + missOpt.join(' ') : '') +
+      '; open=45 выглядело как ' + shown0 + ' при мирском open=' + set0.open +
+      '; поле 70 -> open=' + open70 + '; галка снята -> grabOn=' + grabOff +
+      '; вернули -> open=' + back0.open + ', grabOn=' + back0.grabOn);
+
+    // Стартовая страница обязана влезать без прокрутки: разросшееся описание в браузерном
+    // окне шлема закрывало кнопку «Войти в AR», и до неё приходилось скроллить. Мерить надо
+    // высотой самой карточки: scrollHeight контейнера не может быть меньше clientHeight,
+    // поэтому на заведомо низкой странице он показывает ровно высоту окна и про запас
+    // ничего не говорит (на этом прогоне было 493/493 при зелёном результате).
+    var stEl = document.getElementById('start'), cardEl = stEl.firstElementChild;
+    var cs = getComputedStyle(stEl);
+    var havePx = stEl.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    var needPx = cardEl.getBoundingClientRect().height;
+    ok('стартовая страница влезает без прокрутки', needPx <= havePx,
+      'карточка ' + needPx.toFixed(0) + ' px при доступных ' + havePx.toFixed(0) +
+      ' px, запас ' + (havePx - needPx).toFixed(0) + ' px (окно ' + window.innerWidth +
+      '×' + window.innerHeight + ')');
   } catch (err) {
     exc = String(err && err.stack || err);
   }
