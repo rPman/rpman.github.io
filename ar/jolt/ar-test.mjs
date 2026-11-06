@@ -327,29 +327,48 @@ const driver = `
       H.grab().length === 0 && sameFinger > 10,
       'кадров с контактом ' + sameFinger + ' из 60, захватов ' + H.grab().length);
 
-    // L2c. ладонь с ладонью одной кисти — не держат; ладонь с пальцем — держат
+    // L2c. правило зацепления (решение владельца 2026-11-05): ладонь СВОЕЙ руки зацепление не
+    // устанавливает — на шлеме достаточно прижать кубик ладонью вместе с пальцем той же руки,
+    // и предмет прилипает, а разжаться такому нечем. Законны: пара с ДРУГОЙ руки (в том числе
+    // ладонь с ладонью) и щепоть двух РАЗНЫХ пальцев одной руки.
     cleanRow();
+    var samePalm = 0;
     for (var l2c = 0; l2c < 60; l2c++) {
-      var xw = 0.09 - l2c * 0.0006;
+      var xw = 0.09 - l2c * 0.001;              // доводим глубоко: контакт на |x| <= 0.056
       H.setJoint(0, xw, 0, 0, FR, 0);            // запястье
       H.setJoint(5, -xw, 0, 0, FR, 0);           // плюсневая кость указательного
       H.stepTargets(1);
+      if (H.info().contacts > 0) samePalm++;
     }
     var palmPalm = H.grab().length;
-    var palmTouch = H.info().contacts;
     cleanRow();
+    var samePF = 0;
+    for (var l2e = 0; l2e < 60; l2e++) {
+      var xwf = 0.09 - l2e * 0.001;
+      H.setJoint(0, xwf, 0, 0, FR, 0);           // ладонь левой
+      H.setJoint(9, -xwf, 0, 0, FR, 0);          // кончик указательного ТОЙ ЖЕ руки
+      H.stepTargets(1);
+      if (H.info().contacts > 0) samePF++;
+    }
+    var palmFingerSame = H.grab().length;
+    cleanRow();
+    var crossPF = 0;
     var wristTake = null;
     for (var l2d = 0; l2d < 90; l2d++) {
-      wristTake = 0.12 - l2d * 0.0015;
-      H.setJoint(0, wristTake, 0, 0, FR, 0);     // ладонь слева
-      H.setJoint(9, -wristTake, 0, 0, FR, 0);    // кончик указательного справа
+      wristTake = 0.09 - l2d * 0.001;
+      H.setJoint(0, wristTake, 0, 0, FR, 0);     // ладонь левой с одной стороны
+      H.setJoint(34, -wristTake, 0, 0, FR, 0);   // кончик указательного ПРАВОЙ с другой
       H.stepTargets(1);
+      if (H.info().contacts > 0) crossPF++;
       if (H.grab().length) break;
     }
-    ok('ладонь с ладонью не держат, ладонь с пальцем держат',
-      palmPalm === 0 && H.grab().length === 1,
-      'запястье+плюсневая: захватов ' + palmPalm + ' (контактов в кадре ' + palmTouch +
-      '); запястье+кончик: ' + sidesOfGrab() + ' при |x|=' + (wristTake || 0).toFixed(4));
+    ok('ладонь своей руки зацепление не ставит; чужая рука и щепоть — ставят',
+      palmPalm === 0 && palmFingerSame === 0 && H.grab().length === 1 && samePalm > 5 &&
+      samePF > 5 && crossPF >= 3,
+      'запястье+плюсневая одной руки: захватов ' + palmPalm + ' (кадров с контактом ' + samePalm +
+      '); запястье+кончик той же руки: захватов ' + palmFingerSame + ' (кадров с контактом ' +
+      samePF + '); запястье левой + кончик правой: ' + sidesOfGrab() + ' при |x|=' +
+      (wristTake || 0).toFixed(4) + ' (кадров с контактом ' + crossPF + ')');
 
     // L3. захват тащит шарик за собой и держит, пока пальцы сжимаются
     cleanRow();
@@ -739,6 +758,80 @@ const driver = `
       'манифолдов касания в кадре ' + cont22 + ' (держащая конечность исключена из коллизий), ' +
       'маркеров держателей ' + dots22 + ' при ' + (H.grab().length ? H.grab()[0].slots.length : 0) +
       ' шарах захвата');
+
+    // L23. правая ЛАДОНЬ входит в захват, который держит левая. Встречная пара ищется и по
+    // держащим шарам, иначе правило «ладонь своей руки не в счёт» отняло бы и двухрукие
+    // хватки: живой лог держит куб именно двумя ладонями (grab|cube|12|R,L).
+    cleanRow();
+    var gx23 = squeezeIn(0);
+    H.stepTargets(80);                        // окно повторного взятия у правой должно истечь
+    var rej23 = H.regrabList(), joined23 = false;
+    for (var l23 = 0; l23 < 70; l23++) {
+      var x23 = -0.09 + l23 * 0.0012;         // ладонь правой подъезжает со стороны -x
+      H.setJoint(25, x23, 0.018, 0, FR, 0);   // запястье правой
+      H.setJoint(26, x23, -0.018, 0, FR, 0);  // плюсневая кость большого той же руки
+      pin(gx23, 0, 0);                        // левая при этом держит
+      if (H.grab().length === 1 && H.grab()[0].sides.length === 2) { joined23 = true; break; }
+    }
+    var g23 = H.grab().length ? H.grab()[0] : null;
+    ok('правая ладонь входит в захват левой: пара считается и по держащим шарам',
+      gx23 !== null && joined23 && !!g23 && g23.sides.length === 2 &&
+      g23.slots.indexOf(25) >= 0,
+      'захватов ' + H.grab().length + ' : ' + sidesOfGrab() + ', слоты ' +
+      JSON.stringify(g23 ? g23.slots : []) + ', подъезд правой с x=-0.090 до x=' +
+      (x23 || 0).toFixed(3) + ', запретов повторного взятия в начале: ' +
+      JSON.stringify(rej23));
+
+    // L24. то же правило пар прямо по слотам — поведением его проверить нельзя, не перебрав
+    // все комбинации, а разъезд тут ровно тот, из-за которого куб прилипал к ладони.
+    var lt = [[9, 14, true], [9, 19, true], [8, 9, false], [0, 5, false], [0, 9, false],
+      [5, 34, true], [0, 34, true], [0, 26, true], [25, 26, false], [25, 9, true]];
+    var badLt = lt.filter(function (e) { return H.latch(e[0], e[1]) !== e[2]; })
+      .map(function (e) { return e[0] + '/' + e[1]; });
+    ok('правило пар зацепления: щепоть и чужая рука — да, ладонь своей руки и один палец — нет',
+      badLt.length === 0, badLt.length ? 'разошлись пары: ' + badLt.join(' ') :
+      'щепоть 9/14 и 9/19; один палец 8/9; ладонь своей руки 0/5 и 0/9 и 25/26; палец+ладонь ' +
+      'разных рук 5/34 и 25/9; ладонь с ладонью разных рук 0/26 и 0/34');
+
+    // L25. порядок и имена суставов: быстрый путь (fillPoses) раскладывает позы в порядке
+    // обхода XRHand, которым правит спека. Прежний JOINT_ORDER имел у четырёх длинных пальцев
+    // distal раньше intermediate (два средних сустава лежали в чужих слотах), а имена без
+    // «-finger-» не находил запасной путь s.hand.get(имя) — он давал 5 суставов вместо 25.
+    var SPEC_JOINTS = ['wrist',
+      'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+      'index-finger-metacarpal', 'index-finger-phalanx-proximal',
+      'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+      'middle-finger-metacarpal', 'middle-finger-phalanx-proximal',
+      'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+      'ring-finger-metacarpal', 'ring-finger-phalanx-proximal',
+      'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+      'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal',
+      'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'];
+    var gotJ = H.joints();
+    var diffJ = [];
+    for (var l25 = 0; l25 < SPEC_JOINTS.length; l25++) {
+      if (gotJ[l25] !== SPEC_JOINTS[l25]) diffJ.push(l25 + ':' + gotJ[l25]);
+    }
+    ok('порядок и имена суставов совпадают со спекой WebXR',
+      gotJ.length === 25 && diffJ.length === 0,
+      diffJ.length ? 'разошлись слоты ' + diffJ.join(' ') :
+      '25 имён, кончики в слотах 4/9/14/19/24, у длинных пальцев intermediate раньше distal');
+
+    // L26. вынос сферы кончика: спека ставит позу *-tip на СУСТАВ концевой фаланги, а плоть
+    // кончика лежит за ней ещё примерно на radius, и радиус мы ещё и режем пополам. Сдвиг —
+    // TIP_EXTEND долей СЫРОГО radius вдоль кости (distal -> tip), от половинного радиуса он не
+    // зависит. Без этого прокси-палец оканчивался в ~7 мм от сустава там, где настоящий кончик
+    // в ~14 мм (замечание владельца 2026-11-05 «шарики не на самых кончиках»).
+    var ext26 = H.tipExt(), s26 = H.tipPoint(0, 0, 0, -0.05, 0, 0, 0.014);
+    H.cfg({ tip: 0 });
+    var sOff = H.tipPoint(0, 0, 0, -0.05, 0, 0, 0.014);
+    H.cfg({ tip: ext26 });
+    ok('сферы кончиков вынесены вперёд вдоль кости на долю сырого radius',
+      ext26 > 0 && Math.abs(s26[0] - ext26 * 0.014) < 1e-6 && Math.abs(s26[1]) < 1e-9 &&
+      Math.abs(s26[2]) < 1e-9 && sOff[0] === 0,
+      'TIP_EXTEND ' + ext26 + ' (правится ?tip=50): кость 50 мм, сырой radius 14 мм -> сдвиг ' +
+      s26.map(function (v) { return v.toFixed(4); }).join(',') + '; при ?tip=0 сдвиг ' +
+      sOff.map(function (v) { return v.toFixed(4); }).join(','));
 
     // L14/L15/L16 — три способа отпускания, найденные живым заходом на PICO 2026-11-05: предмет
     // висел в захвате по 10-14 с (отпускал только loss), а release и grab шли в одну секунду.

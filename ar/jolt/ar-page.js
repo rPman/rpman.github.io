@@ -30,21 +30,32 @@ const LATERAL = [-0.28, 0.00, 0.30];      // м вдоль «вправо» от
 const MAX_SPEED = 2.5, MAX_SPIN = 10;
 const DAMP = 6, DAMP_A = 6;               // v *= 1/(1+d*dt) за шаг: ~1 с до остановки
 
-/* Порядок суставов кисти фиксирован спекой WebXR Hand Input: wrist, затем большой (без
- * intermediate) и по пять на остальные пальцы. Индекс слота = base + позиция в этом списке,
- * поэтому руки между собой не путаются и тесты ссылаются на сустав по номеру. */
+/* Порядок и имена суставов фиксированы спекой WebXR Hand Input (enum XRHandJoint и таблица
+ * skeleton joints, которой обязан следовать обход XRHand — на нём висит быстрый путь
+ * fillPoses): wrist, затем большой (без intermediate) и по пять на остальные пальцы:
+ * metacarpal, proximal, INTERMEDIATE, DISTAL, tip. До 2026-11-05 фаланги четырёх длинных
+ * пальцев были переписаны вручную наоборот (distal раньше intermediate), поэтому в быстром
+ * пути два средних сустава каждого длинного пальца лежали в чужих слотах; кончики попадали в
+ * свои слоты всегда (tip — пятый в группе в любом порядке). Имена длинных пальцев в спеке с
+ * «-finger-»: без них запасной путь s.hand.get(имя) не находил ни одного сустава длинного
+ * пальца и давал 5 суставов вместо 25. Индекс слота = позиция в этом списке, поэтому руки
+ * между собой не путаются и тесты ссылаются на сустав по номеру. */
 const JOINT_ORDER = ['wrist',
   'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
-  'index-metacarpal', 'index-phalanx-proximal', 'index-phalanx-distal',
-  'index-phalanx-intermediate', 'index-tip',
-  'middle-metacarpal', 'middle-phalanx-proximal', 'middle-phalanx-distal',
-  'middle-phalanx-intermediate', 'middle-tip',
-  'ring-metacarpal', 'ring-phalanx-proximal', 'ring-phalanx-distal',
-  'ring-phalanx-intermediate', 'ring-tip',
-  'pinky-metacarpal', 'pinky-phalanx-proximal', 'pinky-phalanx-distal',
-  'pinky-phalanx-intermediate', 'pinky-tip'];
+  'index-finger-metacarpal', 'index-finger-phalanx-proximal',
+  'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+  'middle-finger-metacarpal', 'middle-finger-phalanx-proximal',
+  'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+  'ring-finger-metacarpal', 'ring-finger-phalanx-proximal',
+  'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+  'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal',
+  'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'];
 const HAND_SLOTS = JOINT_ORDER.length;    // 25
 const INDEX_TIP = 9;
+/* Предок каждого кончика по цепочке пальца — плюсневая/средняя фаланга той же кисти: по ней
+ * вычисляется направление «наружу от пальца» для выноса сферы кончика (см. extendTip). */
+const TIP_PREV = JOINT_ORDER.map((n) => n.endsWith('-tip')
+  ? JOINT_ORDER.indexOf(n.slice(0, -4) + 'phalanx-distal') : -1);
 const handSlot = (side, j) => side * HAND_SLOTS + j;
 const CTRL_SLOT = 2 * HAND_SLOTS;         // 50, 51 — контроллеры, когда руки не читаются
 const MAX_SLOTS = 2 * HAND_SLOTS + 2;     // 52 кинематических сферы максимум
@@ -62,6 +73,21 @@ let showHands = QS.get('proxy') !== '0';
  * Контроллер (PAD_R) и курсор превью (FINGER_R0) — не кисть, они не меняются. */
 const JOINT_R_SCALE = 0.5;
 const MIN_JOINT_R = 0.002, MAX_JOINT_R = 0.015, FINGER_R0 = 0.011, PAD_R = 0.020;
+/* Кончик пальца. Поза *-tip в XR стоит на суставе концевой фаланги, а не на коже: спека
+ * определяет radius как «шар, примерно касающийся кожи с обеих сторон кисти», и отдельно
+ * разрешает реализациям смещать начало отсчёта tip-сустава. То есть плоть кончика лежит ЗА
+ * позой ещё примерно на radius, а мы радиус ещё и режем пополам — поверхность прокси-сферы
+ * отстояла от сустава на 0.5·radius вместо ~1·radius (на PICO: 7 мм там, где настоящий
+ * кончик в ~14 мм; замечание владельца 2026-11-05 «шарики не на самых кончиках»). Сферы
+ * кончиков выносим вперёд вдоль кости пальца на TIP_EXTEND долей СЫРОГО XR-radius (половинный
+ * радиус ладони при этом остаётся). Правится на ходу: ?tip=50 (сотые доли radius), ?tip=0 —
+ * как было. */
+let TIP_EXTEND = (() => {
+  // QS.get() вне адреса даёт null, а +null === 0: без явной проверки QS.has параметр ?tip=0
+  // неотличим от «параметра нет», и вынос кончиков молча выключался сам.
+  const q = +QS.get('tip');
+  return QS.has('tip') && isFinite(q) && q >= 0 ? q / 100 : 0.5;
+})();
 const BEACON = 'https://yokko.duckdns.org/ar-ht/rep.gif';
 let leashMeters = isFinite(+QS.get('leash')) && +QS.get('leash') > 0 ? +QS.get('leash') : 0.9;
 let beaconOn = !QS.has('nobeacon');
@@ -333,6 +359,14 @@ const driveBuf = new Float32Array(MAX_SLOTS * 4);
  * группы — сторона+группа, значит ладонь левой и ладонь правой РАЗНЫЕ группы: держать двумя
  * руками можно, в том числе двумя ладонями.
  *
+ * КАКОЕ ЗАЦЕПЛЕНИЕ ЗАКОННОЕ (правило владельца 2026-11-05). Встречная пара, которая включает
+ * захват, обязана быть либо с РАЗНЫХ рук, либо из двух РАЗНЫХ ПАЛЬЦЕВ одной руки (щепоть).
+ * Ладонь с пальцем той же руки зацепление не устанавливает: на PICO ладонь — шесть крупных
+ * шаров, и её одного касания кубика вместе с кончиком этой же руки хватало, чтобы предмет
+ * прилип, а отпускалось это только curl’ом, когда пальцы наконец разгибались (живой лог:
+ * grab|cube|4|R висел 7 с при v 2.29 м/с). Ладонь↔ладонь двух рук остаётся законной парой —
+ * именно так держат предмет двумя руками и именно для неё работает мера разъезда (SPREAD).
+ *
  * Как держим: фигура В ОСТАЁТСЯ ДИНАМИКОЙ, а захват ведёт её скоростью к кадру захвата (так же,
  * как ведутся пальцы). Раньше на время захвата она становилась кинематиком, и это было видно
  * глазами: kinematic<->kinematic контактов не бывает вовсе (замер в spike.mjs), поэтому держимый
@@ -479,8 +513,9 @@ const sideBusy = (side) => {          // рука уже держит другу
 };
 
 /* Кандидаты на захват по контактам ПРЕДЫДУЩЕГО шага: фигура -> стороны и слоты, которые её
- * держат. Кандидат принимается, только если держат РАЗНЫЕ группы и хотя бы одна оппозитивная
- * пара приходит из разных групп; все участвующие руки обязаны быть свободны. */
+ * держат. Кандидат принимается, только если нашлась встречная пара, законная по правилу выше
+ * (разные руки или два разных пальца), и все участвующие руки свободны; держат при этом
+ * РАЗНЫЕ группы. */
 function gripCandidates() {
   const byFig = new Map();
   for (const c of frameContacts) {
@@ -511,45 +546,66 @@ function gripCandidates() {
 
 /* Вторая рука приходит ВНУТРЬ держимой фигуры: контактов с ней нет (оба тела кинематики),
  * поэтому кандидатом считает геометрия — какие шары руки внутри формы и держат ли они с двух
- * сторон. Направление толкания — из шара к ближайшей точке поверхности. */
+ * сторон. Направление толкания — из шара к ближайшей точке поверхности. Пара встречных
+ * направлений ищется НЕ только внутри приходящей руки: правая ладонь, прижавшаяся к предмету,
+ * который держит левая, — это законная двухрукая хватка (разные руки), а своей ладонью
+ * зацепиться по-прежнему нельзя (latchPair). */
 function joinCandidates() {
   const out = [];
   for (const g of grabs.values()) {
     for (let side = 0; side < 2; side++) {
       if (g.groups.has(side) || sideBusy(side) !== null) continue;
       if (regrabBlocked(g.id, side)) continue;      // та же рука сразу после отпускания
-      const entries = [];
+      const inner = [];
       for (let j = 0; j < HAND_SLOTS; j++) {
         const s = side * HAND_SLOTS + j, t = targets[s];
         if (!t.live) continue;
         const si = surfaceInfo(g.id, t.x, t.y, t.z);
         if (si.gap > slotR[s]) continue;                     // шар ещё снаружи формы
-        entries.push([s, [-si.nx, -si.ny, -si.nz]]);
+        inner.push([s, [-si.nx, -si.ny, -si.nz]]);
       }
-      const slots = gripSlotsOf(entries);
-      if (slots) out.push({ fig: g.id, side, slots });
+      if (inner.length < GRAB_MIN_JOINTS) continue;          // рука обязана трогать предмет
+      const probe = inner.slice();
+      for (const s of allSlots(g)) {
+        const t = targets[s];
+        if (!t.live) continue;
+        const fi = surfaceInfo(g.id, t.x, t.y, t.z);
+        probe.push([s, [-fi.nx, -fi.ny, -fi.nz]]);
+      }
+      if (opposedPair(probe)) out.push({ fig: g.id, side, slots: inner.map((e) => e[0]) });
     }
   }
   return out;
 }
 
-/* Зацепление устанавливают шары из РАЗНЫХ групп: два шара одного пальца или одной ладони
- * друг напротив друга не считаются (ключ группы один и тот же), а палец+ладонь, два разных
- * пальца и любые шары разных рук — считаются (в ключе группы есть сторона кисти). Внутри
- * захвата оказываются ВСЕ шары, которые сейчас трогают предмет: они им и управляют. */
-function gripSlotsOf(entries) {
-  let opposed = false;
-  for (let i = 0; i < entries.length && !opposed; i++) {
+/* Зацепление устанавливают шары из РАЗНЫХ групп, и либо с РАЗНЫХ кистей, либо оба — пальцы.
+ * Ладонь СВОЕЙ руки в установлении зацепления не участвует вовсе (решение владельца
+ * 2026-11-05): на PICO ладонь — это шесть крупных шаров, и достаточно прижать к кубику её
+ * вместе с пальцем той же руки, как предмет прилипал, а разжаться такому захват нечем. Ладонь
+ * с ладонью ДВУХ рук — законная пара, как и два разных пальца одной кисти (щепоть), которой
+ * владелец и держит предмет одной рукой. Внутри захвата оказываются ВСЕ шары, которые сейчас
+ * трогают предмет: они им и управляют — правило группы ограничивает только создание. */
+function latchPair(si, sj) {
+  if (groupKey(si) === groupKey(sj)) return false;            // один палец / одна ладонь
+  if (handOfSlot(si) !== handOfSlot(sj)) return true;         // разные руки: ладонь можно
+  return JOINT_GROUP[si % HAND_SLOTS] !== 'palm' && JOINT_GROUP[sj % HAND_SLOTS] !== 'palm';
+}
+
+/* Есть ли среди шаров хотя бы одна пара, держащая предмет с двух сторон (косинус направлений
+ * толкания ниже GRAB_OPPOSE) и имеющая на это право по правилу выше. */
+function opposedPair(entries) {
+  for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
-      const si = entries[i][0], sj = entries[j][0];
-      if (groupKey(si) === groupKey(sj)) continue;           // один палец / одна ладонь
+      if (!latchPair(entries[i][0], entries[j][0])) continue;
       const di = entries[i][1], dj = entries[j][1];
-      if (di[0] * dj[0] + di[1] * dj[1] + di[2] * dj[2] > GRAB_OPPOSE) continue;
-      opposed = true;
-      break;
+      if (di[0] * dj[0] + di[1] * dj[1] + di[2] * dj[2] <= GRAB_OPPOSE) return true;
     }
   }
-  if (!opposed) return null;
+  return false;
+}
+
+function gripSlotsOf(entries) {
+  if (!opposedPair(entries)) return null;
   const slots = [...new Set(entries.map((e) => e[0]))];
   return slots.length >= GRAB_MIN_JOINTS ? slots : null;
 }
@@ -582,8 +638,11 @@ function aperture(slots) {
  * вообще уведена из кадра) в среднее не входят: GRAB_JOINT_REACH отсекает абсурдные расстояния,
  * иначе убранная в тесте кисть дала бы «раскрытие» в 2.5 м. */
 const FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky'];
-const META_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(f + '-metacarpal'));
-const TIP_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(f + '-tip'));
+/* Имена суставов в спеке: у большого «thumb-…», у остальных «<палец>-finger-…» — одним
+ * перебором, чтобы не разъехаться с JOINT_ORDER. */
+const fingerJoint = (f, j) => (f === 'thumb' ? 'thumb-' : f + '-finger-') + j;
+const META_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(fingerJoint(f, 'metacarpal')));
+const TIP_SLOT = FINGER_NAMES.map((f) => JOINT_ORDER.indexOf(fingerJoint(f, 'tip')));
 function handCurl(side) {
   let sum = 0, n = 0;
   for (let f = 0; f < FINGER_NAMES.length; f++) {
@@ -1055,6 +1114,19 @@ for (let i = 0; i < MAX_SLOTS; i++) {
 
 const clampR = (r) => (isFinite(r) ? Math.min(MAX_JOINT_R, Math.max(MIN_JOINT_R, r)) : FINGER_R0);
 
+/* Вынос сферы кончика за сустав: на TIP_EXTEND·(сырой XR-radius) от фаланги-предка наружу.
+ * Направление — сама кость пальца (distal → tip). Если предка в этом кадре нет, сдвига нет:
+ * выдумывать направление по матрице сустава нельзя, спека оставляет реализациям своё
+ * согласование осей, а неверное направление унесло бы палец сквозь предмет. */
+function extendTip(x, y, z, px, py, pz, rawR) {
+  if (!(TIP_EXTEND > 0) || !(rawR > 0)) return { x, y, z };
+  if (!isFinite(px) || !isFinite(py) || !isFinite(pz)) return { x, y, z };
+  const dx = x - px, dy = y - py, dz = z - pz, L = Math.hypot(dx, dy, dz);
+  if (!(L > 1e-4)) return { x, y, z };
+  const k = TIP_EXTEND * rawR / L;
+  return { x: x + dx * k, y: y + dy * k, z: z + dz * k };
+}
+
 /* Списки XRJointSpace кэшируются на объект XRInputSource: hand.values() каждый кадр даёт новый
  * итератор, а fillPoses/fillJointRadii требуют iterable и обязаны увидеть ОДИН и тот же порядок
  * (он фиксирован спекой). */
@@ -1105,8 +1177,28 @@ function readHand(s, side, frame, refSpace) {
       x = p.x; y = p.y; z = p.z; r = jp.radius;
     }
     if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+    // Кончик выносим вперёд (см. extendTip). Предка берём из того же источника, что и сам
+    // сустав: в быстром пути fillPoses залил все 25 поз, даже когда ?hands=index пишет
+    // только кончик; в запасном пути вне кадра остались только прочитанные суставы, поэтому
+    // там предок обязан быть живым в ЭТОМ кадре (live обнуляется в начале каждого кадра).
+    let sx = x, sy = y, sz = z;
+    const pj = TIP_PREV[j];
+    if (pj >= 0) {
+      let px, py, pz;
+      if (fast) {
+        const o2 = pj * 16;
+        px = pose16[o2 + 12]; py = pose16[o2 + 13]; pz = pose16[o2 + 14];
+      } else if (targets[handSlot(side, pj)].live) {
+        const pt = targets[handSlot(side, pj)];
+        px = pt.x; py = pt.y; pz = pt.z;
+      } else {
+        px = py = pz = NaN;
+      }
+      const e = extendTip(x, y, z, px, py, pz, r);
+      sx = e.x; sy = e.y; sz = e.z;
+    }
     const t = targets[handSlot(side, j)];
-    t.x = x; t.y = y; t.z = z; t.r = clampR(r * JOINT_R_SCALE); t.live = true;
+    t.x = sx; t.y = sy; t.z = sz; t.r = clampR(r * JOINT_R_SCALE); t.live = true;
     if (fast) {
       const o = j * 16;
       for (let k = 0; k < 16; k++) t.m[k] = pose16[o + k];
@@ -1464,6 +1556,7 @@ window.__ja = {
     if (o.open !== undefined) GRAB_OPEN = o.open;
     if (o.fit !== undefined) GRAB_FIT = o.fit;
     if (o.slip !== undefined) GRAB_SLIP = o.slip;
+    if (o.tip !== undefined) TIP_EXTEND = o.tip;
     if (o.grab !== undefined) {
       grabOn = !!o.grab;
       if (!grabOn) for (const [, g] of [...grabs]) grabEnd(g, 'cfg');
@@ -1499,6 +1592,20 @@ window.__ja = {
     const s = surfaceInfo(id, x, y, z);
     return { gap: +s.gap.toFixed(4), n: [+s.nx.toFixed(3), +s.ny.toFixed(3), +s.nz.toFixed(3)] };
   },
+  // Порядок и имена суставов, которыми страница подписывает слоты: их обязан дать тест,
+  // потому что быстрый путь (fillPoses) раскладывает позы В ЭТОМ порядке, и расхождение со
+  // спекой молча меняет суставы местами (на этом два средних сустава длинных пальцев лежали
+  // в чужих слотах, а запасной путь по имени не находил ни одного длинного пальца).
+  joints: () => JOINT_ORDER.slice(),
+  // Вынос сферы кончика: доля сырого radius и чистая геометрия сдвига (проверяет, что сдвиг
+  // идёт вдоль кости наружу и что половинный радиус ладони на него не влияет).
+  tipExt: () => TIP_EXTEND,
+  tipPoint(x, y, z, px, py, pz, rawR) {
+    const e = extendTip(x, y, z, px, py, pz, rawR);
+    return [+(e.x - x).toFixed(5), +(e.y - y).toFixed(5), +(e.z - z).toFixed(5)];
+  },
+  // Какие пары шаров имеют право зацепить предмет (правило групп и рук) — прямо по слотам.
+  latch(a, b) { return latchPair(a, b); },
   ignores() { return Math.round(ignoreSet.size / (2 * HAND_SLOTS)); },
   graceList() {
     return grace.map((e) => ({ fig: e.fig, side: e.side, ms: Math.round((e.until - simSteps) * DT * 1000) }));
